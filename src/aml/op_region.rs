@@ -8,16 +8,14 @@ pub struct OpRegion {
     pub parent_device_path: AmlName,
 }
 
-pub trait RegionHandler {
-    fn read_u8(&self, region: &OpRegion) -> Result<u8, AmlError>;
-    fn read_u16(&self, region: &OpRegion) -> Result<u16, AmlError>;
-    fn read_u32(&self, region: &OpRegion) -> Result<u32, AmlError>;
-    fn read_u64(&self, region: &OpRegion) -> Result<u64, AmlError>;
-
-    fn write_u8(&self, region: &OpRegion, value: u8) -> Result<(), AmlError>;
-    fn write_u16(&self, region: &OpRegion, value: u16) -> Result<(), AmlError>;
-    fn write_u32(&self, region: &OpRegion, value: u32) -> Result<(), AmlError>;
-    fn write_u64(&self, region: &OpRegion, value: u64) -> Result<(), AmlError>;
+/// Hardening: a host's handler for one region space (the embedded controller's above all). The interpreter splits a
+/// field into accesses of the field's access width (a `ByteAcc` field of 16 bits is two 8-bit reads, composed
+/// little-endian), checks each against the region's length, and calls the handler with the lock released.
+pub trait RegionHandler: Send + Sync {
+    /// Reads `width_bits` (8, 16, 32 or 64) at byte `offset` from the start of `region`.
+    fn read(&self, region: &OpRegion, offset: u64, width_bits: u8) -> Result<u64, AmlError>;
+    /// Writes the low `width_bits` of `value` at byte `offset` from the start of `region`.
+    fn write(&self, region: &OpRegion, offset: u64, width_bits: u8, value: u64) -> Result<(), AmlError>;
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -51,6 +49,26 @@ impl From<u8> for RegionSpace {
             9 => RegionSpace::GenericSerialBus,
             10 => RegionSpace::Pcc,
             _ => RegionSpace::Oem(value),
+        }
+    }
+}
+
+// Hardening: the space's number, as `_REG` takes it.
+impl From<RegionSpace> for u8 {
+    fn from(space: RegionSpace) -> u8 {
+        match space {
+            RegionSpace::SystemMemory => 0,
+            RegionSpace::SystemIO => 1,
+            RegionSpace::PciConfig => 2,
+            RegionSpace::EmbeddedControl => 3,
+            RegionSpace::SmBus => 4,
+            RegionSpace::SystemCmos => 5,
+            RegionSpace::PciBarTarget => 6,
+            RegionSpace::Ipmi => 7,
+            RegionSpace::GeneralPurposeIo => 8,
+            RegionSpace::GenericSerialBus => 9,
+            RegionSpace::Pcc => 10,
+            RegionSpace::Oem(value) => value,
         }
     }
 }

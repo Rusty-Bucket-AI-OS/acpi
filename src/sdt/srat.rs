@@ -92,7 +92,9 @@ impl<'a> Iterator for SratEntryIter<'a> {
                         &*(entry_pointer as *const LocalApicX2Affinity)
                     }));
                 }
-                3 => return Some(SratEntry::GiccAffinity(unsafe { &*(entry_pointer as *const GiccAffinity) })),
+                3 => {
+                    return Some(SratEntry::GiccAffinity(unsafe { &*(entry_pointer as *const GiccAffinity) }));
+                }
                 4 => {
                     return Some(SratEntry::GicItsAffinity(unsafe { &*(entry_pointer as *const GicItsAffinity) }));
                 }

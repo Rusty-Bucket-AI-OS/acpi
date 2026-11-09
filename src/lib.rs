@@ -32,7 +32,12 @@
 //! interfaces, such as [`PlatformInfo`], [`PciConfigRegions`], or [`HpetInfo`].
 
 #![no_std]
+// Hardening: the pinned nightly calls this feature partly stable; it is still what the table side's allocators need.
+#![allow(stable_features)]
 #![feature(allocator_api)]
+// Hardening: upstream's unsafe blocks carry no `// SAFETY:` comments, and a kernel embedding this crate may deny
+// that lint; the rewritten sites (`gain_mut` in `aml/mod.rs` and `aml/object.rs`) have them.
+#![allow(clippy::undocumented_unsafe_blocks)]
 
 #[cfg_attr(test, macro_use)]
 #[cfg(test)]
@@ -93,7 +98,9 @@ where
          */
         match rsdp_mapping.validate() {
             Ok(()) => (),
-            Err(AcpiError::RsdpIncorrectSignature) => return Err(AcpiError::RsdpIncorrectSignature),
+            Err(AcpiError::RsdpIncorrectSignature) => {
+                return Err(AcpiError::RsdpIncorrectSignature);
+            }
             Err(AcpiError::RsdpInvalidOemId) | Err(AcpiError::RsdpInvalidChecksum) => {
                 warn!("RSDP has invalid checksum or OEM ID. Continuing.");
             }
@@ -467,13 +474,23 @@ pub trait Handler: Clone {
     #[cfg(feature = "aml")]
     fn handle_debug(&self, _object: &aml::object::Object) {}
 
+    /// Hardening: the AML ran `Fatal`. The default logs it (it was a `panic!`); the evaluation then ends with
+    /// `AmlError::FatalOpcode` either way.
     #[cfg(feature = "aml")]
     fn handle_fatal_error(&self, fatal_type: u8, fatal_code: u32, fatal_arg: u64) {
-        panic!(
+        log::error!(
             "Fatal error while executing AML (encountered DefFatalOp). fatal_type = {}, fatal_code = {}, fatal_arg = {}",
-            fatal_type, fatal_code, fatal_arg
+            fatal_type,
+            fatal_code,
+            fatal_arg
         );
     }
+
+    /// Hardening: the AML ran `Notify(object, value)` (a battery's status changed, a lid closed, a device was added):
+    /// `path` is the notified object as the namespace resolved it, e.g. `\_SB.PCI0.LPCB.EC0.BAT0`. The default
+    /// does nothing. Called while the interpreter runs: queue the work, don't evaluate from here.
+    #[cfg(feature = "aml")]
+    fn handle_notify(&self, _path: &aml::namespace::AmlName, _value: u64) {}
 }
 
 #[cfg(test)]

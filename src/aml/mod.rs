@@ -33,7 +33,6 @@ use crate::{
     sdt::{SdtHeader, facs::Facs, fadt::Fadt},
 };
 use alloc::{
-    boxed::Box,
     collections::btree_map::BTreeMap,
     string::{String, ToString},
     sync::Arc,
@@ -45,7 +44,7 @@ use core::{
     mem,
     slice,
     str::FromStr,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 use log::{info, trace, warn};
 use namespace::{AmlName, Namespace, NamespaceLevelKind};
@@ -66,9 +65,94 @@ use op_region::{OpRegion, RegionHandler, RegionSpace};
 use pci_types::PciAddress;
 use spinning_top::Spinlock;
 
+/// Hardening: limits on what one piece of firmware AML may cost (bounded time and memory). Exceeding any of them is
+/// [`AmlError::LimitExceeded`], and the interpreter stays usable for later evaluations.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Limits {
+    /// Opcodes (and block ends) executed per top-level `load_table` or `evaluate`.
+    pub max_ops: u64,
+    /// Method call nesting (AML methods calling methods).
+    pub max_depth: usize,
+    /// The largest single `Buffer`, `String` or field read the AML may create, in bytes.
+    pub max_buffer_bytes: usize,
+    /// The most elements of one `Package` or `VarPackage`.
+    pub max_package_elements: usize,
+    /// The most objects and levels in the namespace.
+    pub max_namespace_objects: usize,
+    /// Iterations of one `While` loop.
+    pub max_loop_iterations: u64,
+    /// Nested blocks (scopes, devices, `If`, `While`, packages) inside one method or table.
+    pub max_block_nesting: usize,
+    /// The longest an AML `Wait` on an event may wait, in milliseconds (including `Wait(.., 0xffff)`, "forever").
+    pub max_wait_ms: u64,
+    /// The bytes of buffers, strings and field reads one top-level call may create in all.
+    pub max_total_bytes: usize,
+    /// Operations in flight at once in one method or table (an op left without its operands, in a loop, used to
+    /// pile up without bound).
+    pub max_in_flight: usize,
+    /// The longest one top-level `load_table` or `evaluate` may run, in milliseconds of the host's clock
+    /// (`Handler::nanos_since_boot`): a `While` loop of `Sleep`s otherwise holds the interpreter for hours.
+    pub max_call_ms: u64,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Limits {
+            max_ops: 2_000_000,
+            max_depth: 32,
+            max_buffer_bytes: 1024 * 1024,
+            max_package_elements: 4096,
+            max_namespace_objects: 100_000,
+            max_loop_iterations: 1_000_000,
+            max_block_nesting: 256,
+            max_wait_ms: 2000,
+            max_total_bytes: 16 * 1024 * 1024,
+            max_in_flight: 1024,
+            max_call_ms: 5000,
+        }
+    }
+}
+
+/// Hardening: which limit an AML stream ran into.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Limit {
+    Ops,
+    MethodDepth,
+    Reentrancy,
+    BlockNesting,
+    /// The call ran past `max_call_ms`.
+    Deadline,
+    BufferSize,
+    PackageElements,
+    NamespaceObjects,
+    NameDepth,
+    LoopIterations,
+    TotalBytes,
+    InFlight,
+}
+
+/// Hardening: what [`Interpreter::initialize_namespace`] did. Failures of one device never stop the others.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct InitReport {
+    pub devices_initialized: usize,
+    pub sta_failures: usize,
+    pub ini_failures: usize,
+    pub reg_calls: usize,
+    pub reg_failures: usize,
+}
+
+/// Hardening: nested evaluations (an evaluation started while another runs, e.g. `_ADR` evaluated for a PCI config
+/// field read inside a method) beyond this are refused, so firmware cannot recurse the host's stack.
+const MAX_REENTRANT_EVALUATIONS: usize = 4;
+/// Hardening: tries to take the firmware's global lock before `Acquire(\_GL)` gives up.
+const GLOBAL_LOCK_TRIES: u32 = 1000;
+
 /// `Interpreter` implements a virtual machine for the dynamic AML bytecode. It can be used by a
 /// host operating system to load tables containing AML bytecode (generally the DSDT and SSDTs) and
 /// will then manage the AML namespace and all objects created during the life of the system.
+///
+/// Hardening: one thread at a time. The interpreter keeps one stack of method contexts, so a host that may
+/// evaluate from several threads wraps it in a lock of its own.
 pub struct Interpreter<H>
 where
     H: Handler,
@@ -78,11 +162,21 @@ where
     pub object_token: Spinlock<ObjectToken>,
     context_stack: Spinlock<Vec<MethodContext>>,
     dsdt_revision: u8,
-    region_handlers: Spinlock<BTreeMap<RegionSpace, Box<dyn RegionHandler>>>,
+    // Hardening: `Arc`, so a handler is called with the lock released.
+    region_handlers: Spinlock<BTreeMap<RegionSpace, Arc<dyn RegionHandler>>>,
 
     global_lock_mutex: Handle,
-    registers: Arc<FixedRegisters<H>>,
+    // Hardening: optional, so the host can build an interpreter without the table side (`new_bare`).
+    registers: Option<Arc<FixedRegisters<H>>>,
     facs: Option<PhysicalMapping<H, Facs>>,
+
+    // Hardening: limits and the counters they are checked against.
+    limits: Spinlock<Limits>,
+    ops_used: AtomicU64,
+    bytes_used: AtomicUsize,
+    nesting: AtomicUsize,
+    /// The host clock's time (ns) the current top-level call must end by.
+    deadline: AtomicU64,
 }
 
 unsafe impl<H> Send for Interpreter<H> where H: Handler + Send {}
@@ -90,6 +184,11 @@ unsafe impl<H> Sync for Interpreter<H> where H: Handler + Send {}
 
 /// The value returned by the `Revision` opcode.
 const INTERPRETER_REVISION: u64 = 1;
+
+/// Hardening: a constant path, never failing (the names are valid ASCII). Falls back to the root on the impossible error.
+fn static_name(name: &str) -> AmlName {
+    AmlName::from_str(name).unwrap_or_else(|_| AmlName::root())
+}
 
 impl<H> Interpreter<H>
 where
@@ -101,6 +200,22 @@ where
         handler: H,
         dsdt_revision: u8,
         registers: Arc<FixedRegisters<H>>,
+        facs: Option<PhysicalMapping<H, Facs>>,
+    ) -> Interpreter<H> {
+        Self::build(handler, dsdt_revision, Some(registers), facs)
+    }
+
+    /// Hardening: an interpreter with no fixed registers and no FACS: the host parses the tables itself and loads the
+    /// DSDT and SSDTs with [`Interpreter::load_table`]. `Acquire(\_GL)` then only takes the AML-side mutex
+    /// (there is no firmware lock word to take), and releasing it signals nothing to the firmware.
+    pub fn new_bare(handler: H, dsdt_revision: u8) -> Interpreter<H> {
+        Self::build(handler, dsdt_revision, None, None)
+    }
+
+    fn build(
+        handler: H,
+        dsdt_revision: u8,
+        registers: Option<Arc<FixedRegisters<H>>>,
         facs: Option<PhysicalMapping<H, Facs>>,
     ) -> Interpreter<H> {
         info!("Initializing AML interpreter v{}", env!("CARGO_PKG_VERSION"));
@@ -117,20 +232,40 @@ where
             global_lock_mutex,
             registers,
             facs,
+            limits: Spinlock::new(Limits::default()),
+            ops_used: AtomicU64::new(0),
+            bytes_used: AtomicUsize::new(0),
+            nesting: AtomicUsize::new(0),
+            deadline: AtomicU64::new(u64::MAX),
         }
+    }
+
+    /// Hardening: sets the limits for every later load and evaluation.
+    pub fn set_limits(&self, limits: Limits) {
+        *self.limits.lock() = limits;
+        self.namespace.lock().set_max_objects(limits.max_namespace_objects);
+    }
+
+    /// Hardening: the limits in force.
+    pub fn limits(&self) -> Limits {
+        *self.limits.lock()
     }
 
     /// Construct a new `Interpreter` with the given set of ACPI tables. This will automatically
     /// load the DSDT and any SSDTs in the supplied [`AcpiTables`].
     pub fn new_from_platform(platform: &AcpiPlatform<H>) -> Result<Interpreter<H>, AcpiError> {
         fn load_table(interpreter: &Interpreter<impl Handler>, table: AmlTable) -> Result<(), AcpiError> {
+            // Hardening: a table shorter than its header is refused rather than underflowing the length.
+            let Some(stream_len) = (table.length as usize).checked_sub(mem::size_of::<SdtHeader>()) else {
+                return Err(AcpiError::Aml(AmlError::MalformedStream));
+            };
             let mapping = unsafe {
                 interpreter.handler.map_physical_region::<SdtHeader>(table.phys_address, table.length as usize)
             };
             let stream = unsafe {
                 slice::from_raw_parts(
                     mapping.virtual_start.as_ptr().byte_add(mem::size_of::<SdtHeader>()) as *const u8,
-                    table.length as usize - mem::size_of::<SdtHeader>(),
+                    stream_len,
                 )
             };
             interpreter.load_table(stream).map_err(AcpiError::Aml)?;
@@ -175,7 +310,14 @@ where
         match &*object {
             Object::Method { .. } => {
                 self.namespace.lock().add_level(path.clone(), NamespaceLevelKind::MethodLocals)?;
-                let context = MethodContext::new_from_method(object, args, path)?;
+                let context = match MethodContext::new_from_method(object.clone(), args, path.clone()) {
+                    Ok(context) => context,
+                    Err(err) => {
+                        // Hardening: the level added above is not left behind.
+                        let _ = self.namespace.lock().remove_level(path);
+                        return Err(err);
+                    }
+                };
                 self.do_execute_method(context)
             }
             Object::NativeMethod { f, .. } => f(&args),
@@ -197,34 +339,52 @@ where
                     Err(AmlError::ObjectDoesNotExist(not_present))
                 }
             }
+            // Hardening: a path whose parent level does not exist is just as absent.
+            Err(AmlError::LevelDoesNotExist(_)) => Ok(None),
             Err(other) => Err(other),
         }
     }
 
-    pub fn install_region_handler<RH>(&self, space: RegionSpace, handler: RH)
+    /// Hardening: installs the handler for one region space. A second handler for the same space is an error (it used to
+    /// be an `assert!`). Field reads and writes of that space go through it, the native spaces too if one is
+    /// installed for them.
+    pub fn install_region_handler<RH>(&self, space: RegionSpace, handler: RH) -> Result<(), AmlError>
     where
         RH: RegionHandler + 'static,
     {
         let mut handlers = self.region_handlers.lock();
-        assert!(handlers.get(&space).is_none(), "Tried to install handler for same space twice!");
-        handlers.insert(space, Box::new(handler));
+        if handlers.contains_key(&space) {
+            return Err(AmlError::RegionHandlerAlreadyInstalled(space));
+        }
+        handlers.insert(space, Arc::new(handler));
+        Ok(())
+    }
+
+    fn region_handler(&self, space: RegionSpace) -> Option<Arc<dyn RegionHandler>> {
+        self.region_handlers.lock().get(&space).cloned()
     }
 
     /// Initialize the namespace - this should be called after all tables have been loaded and
     /// operation region handlers registered. Specifically, it will call relevant `_STA`, `_INI`,
     /// and `_REG` methods.
-    pub fn initialize_namespace(&self) {
+    ///
+    /// Hardening: one device's failing `_STA` or `_INI` never stops the others; the report counts them. `_REG(space, 1)` is
+    /// run for every device that has an operation region of a space with an installed handler.
+    pub fn initialize_namespace(&self) -> InitReport {
+        let mut report = InitReport::default();
         /*
          * This should match the initialization order of ACPICA and uACPI.
          */
-        if let Err(err) = self.evaluate_if_present(AmlName::from_str("\\_INI").unwrap(), vec![]) {
+        if let Err(err) = self.evaluate_if_present(static_name("\\_INI"), vec![]) {
             warn!("Invoking \\_INI failed: {:?}", err);
+            report.ini_failures += 1;
         }
-        if let Err(err) = self.evaluate_if_present(AmlName::from_str("\\_SB._INI").unwrap(), vec![]) {
+        if let Err(err) = self.evaluate_if_present(static_name("\\_SB._INI"), vec![]) {
             warn!("Invoking \\_SB._INI failed: {:?}", err);
+            report.ini_failures += 1;
         }
 
-        // TODO: run all _REGs for globally-installed handlers (this might need more bookkeeping)
+        self.run_reg_methods(&mut report);
 
         /*
          * We can now initialize each device in the namespace. For each device, we evaluate `_STA`,
@@ -235,13 +395,6 @@ where
          * `_ADR`, `_CID`, `_HID`, `_SUN`, and `_UID`, and so is necessary before further
          * operation.
          */
-        let mut num_devices_initialized = 0;
-        /*
-         * TODO
-         * We clone a copy of the namespace here to traverse while executing all the `_STA` and
-         * `_INI` objects. Avoiding this would be good, but is not easy, as we need
-         * potentially-mutable access while executing all of the methods.
-         */
         let mut namespace = self.namespace.lock().clone();
         let init_status = namespace.traverse(|path, level| {
             match level.kind {
@@ -249,27 +402,36 @@ where
                 | NamespaceLevelKind::Processor
                 | NamespaceLevelKind::ThermalZone
                 | NamespaceLevelKind::PowerResource => {
-                    let should_initialize = match self
-                        .evaluate_if_present(AmlName::from_str("_STA").unwrap().resolve(path)?, vec![])
-                    {
-                        Ok(Some(result)) => {
-                            let Object::Integer(result) = *result else { panic!() };
-                            let status = DeviceStatus(result);
-                            status.present() && status.functioning()
-                        }
+                    let Ok(sta) = static_name("_STA").resolve(path) else {
+                        report.sta_failures += 1;
+                        return Ok(false);
+                    };
+                    let should_initialize = match self.evaluate_if_present(sta, vec![]) {
+                        Ok(Some(result)) => match *result {
+                            Object::Integer(result) => {
+                                let status = DeviceStatus(result);
+                                status.present() && status.functioning()
+                            }
+                            // Hardening: was `panic!()`.
+                            _ => {
+                                report.sta_failures += 1;
+                                false
+                            }
+                        },
                         Ok(None) => true,
                         Err(err) => {
                             warn!("Failed to evaluate _STA for device {}: {:?}", path, err);
+                            report.sta_failures += 1;
                             false
                         }
                     };
 
                     if should_initialize {
-                        num_devices_initialized += 1;
-                        if let Err(err) =
-                            self.evaluate_if_present(AmlName::from_str("_INI").unwrap().resolve(path)?, vec![])
-                        {
+                        report.devices_initialized += 1;
+                        let ini = static_name("_INI").resolve(path);
+                        if let Err(err) = ini.and_then(|ini| self.evaluate_if_present(ini, vec![])) {
                             warn!("Failed to evaluate _INI for device {}: {:?}", path, err);
+                            report.ini_failures += 1;
                         }
                         Ok(true)
                     } else {
@@ -286,29 +448,60 @@ where
             warn!("Error while traversing namespace for devices: {:?}", err);
         }
 
-        info!("Initialized {} devices", num_devices_initialized);
+        info!("Initialized {} devices", report.devices_initialized);
+        report
+    }
+
+    /// Hardening: `_REG(space, 1)` for each device that owns an operation region of a space with a handler.
+    fn run_reg_methods(&self, report: &mut InitReport) {
+        let spaces: Vec<RegionSpace> = self.region_handlers.lock().keys().copied().collect();
+        if spaces.is_empty() {
+            return;
+        }
+        let mut targets: Vec<(AmlName, RegionSpace)> = Vec::new();
+        let namespace = self.namespace.lock().clone();
+        namespace.for_each_object(|object| {
+            if let Object::OpRegion(ref region) = **object
+                && spaces.contains(&region.space)
+                && !targets.iter().any(|(p, s)| *p == region.parent_device_path && *s == region.space)
+            {
+                targets.push((region.parent_device_path.clone(), region.space));
+            }
+        });
+        for (device, space) in targets {
+            let Ok(reg) = static_name("_REG").resolve(&device) else {
+                continue;
+            };
+            let args = vec![Object::Integer(u8::from(space) as u64).wrap(), Object::Integer(1).wrap()];
+            match self.evaluate_if_present(reg, args) {
+                Ok(Some(_)) => report.reg_calls += 1,
+                Ok(None) => {}
+                Err(err) => {
+                    warn!("_REG for {} failed: {:?}", device, err);
+                    report.reg_failures += 1;
+                }
+            }
+        }
     }
 
     pub fn acquire_global_lock(&self, timeout: u16) -> Result<(), AmlError> {
         self.handler.acquire(self.global_lock_mutex, timeout)?;
 
         // Now we've acquired the AML-side mutex, acquire the hardware side
-        // TODO: count the number of times we have to go round this loop / enforce a timeout?
-        loop {
+        // Hardening: bounded, and the AML-side mutex is kept while trying (it was released on every try, and never taken
+        // again).
+        for _ in 0..GLOBAL_LOCK_TRIES {
             if self.try_do_acquire_firmware_lock() {
-                break Ok(());
-            } else {
-                /*
-                 * The lock is owned by the firmware. We have set the pending bit - we now need to
-                 * wait for the firmware to signal it has released the lock.
-                 *
-                 * TODO: this should wait for an interrupt from the firmware. That needs more infra
-                 * so for now let's just spin round and try and acquire it again...
-                 */
-                self.handler.release(self.global_lock_mutex);
-                continue;
+                return Ok(());
             }
+            /*
+             * The lock is owned by the firmware. We have set the pending bit - we now need to
+             * wait for the firmware to signal it has released the lock.
+             */
+            self.handler.stall(10);
         }
+        self.handler.release(self.global_lock_mutex);
+        Err(AmlError::MutexAcquireTimeout)
     }
 
     /// Attempt to acquire the firmware lock, setting the owned bit if the lock is free. If the
@@ -343,8 +536,13 @@ where
 
     pub fn release_global_lock(&self) -> Result<(), AmlError> {
         let is_pending = self.do_release_firmware_lock();
-        if is_pending {
-            self.registers.pm1_control_registers.set_bit(Pm1ControlBit::GlobalLockRelease, true).unwrap();
+        self.handler.release(self.global_lock_mutex);
+        if is_pending && let Some(registers) = &self.registers {
+            // Hardening: was `.unwrap()`.
+            registers
+                .pm1_control_registers
+                .set_bit(Pm1ControlBit::GlobalLockRelease, true)
+                .map_err(|_| AmlError::RegisterAccessFailed)?;
         }
         Ok(())
     }
@@ -371,7 +569,92 @@ where
         }
     }
 
+    /// Hardening: runs a table or a method to its end. Bounds how deeply evaluations nest and how many ops one top-level
+    /// call runs; on any error, every context this call pushed is taken off the shared stack again and their
+    /// method levels are removed from the namespace, so the interpreter stays usable (before, a failed call left
+    /// stale contexts behind, the next `Return` popped one, and a table's context pointed at a stream that was gone).
     fn do_execute_method(&self, mut context: MethodContext) -> Result<WrappedObject, AmlError> {
+        let depth = self.nesting.fetch_add(1, Ordering::AcqRel);
+        if depth == 0 {
+            self.ops_used.store(0, Ordering::Release);
+            self.bytes_used.store(0, Ordering::Release);
+            let budget = self.limits().max_call_ms.saturating_mul(1_000_000);
+            self.deadline.store(self.handler.nanos_since_boot().saturating_add(budget), Ordering::Release);
+        }
+        let result = if depth >= MAX_REENTRANT_EVALUATIONS {
+            Err(AmlError::LimitExceeded(Limit::Reentrancy))
+        } else {
+            let base = self.context_stack.lock().len();
+            let result = self.run_context(&mut context, base);
+            if result.is_err() {
+                self.unwind(context, base);
+            }
+            result
+        };
+        self.nesting.fetch_sub(1, Ordering::AcqRel);
+        result
+    }
+
+    /// Hardening: after an error: drops the failed context and every context above `base`, removing their method levels.
+    fn unwind(&self, context: MethodContext, base: usize) {
+        let mut dropped = vec![context];
+        {
+            let mut stack = self.context_stack.lock();
+            while stack.len() > base {
+                if let Some(old) = stack.pop() {
+                    dropped.push(old);
+                }
+            }
+        }
+        for old in dropped {
+            if let Some(scope) = old.method_scope() {
+                let _ = self.namespace.lock().remove_level(scope);
+            }
+        }
+    }
+
+    /// Hardening: a size the AML wants to create, before anything is allocated: against the limit for one object and the
+    /// budget of the whole top-level call.
+    fn check_size(&self, bytes: usize) -> Result<(), AmlError> {
+        let limits = self.limits();
+        if bytes > limits.max_buffer_bytes {
+            return Err(AmlError::LimitExceeded(Limit::BufferSize));
+        }
+        let used = self.bytes_used.fetch_add(bytes, Ordering::AcqRel).saturating_add(bytes);
+        if used > limits.max_total_bytes { Err(AmlError::LimitExceeded(Limit::TotalBytes)) } else { Ok(()) }
+    }
+
+    /// Hardening: one more op of the current top-level call.
+    fn count_op(&self, limits: &Limits) -> Result<(), AmlError> {
+        let used = self.ops_used.fetch_add(1, Ordering::AcqRel) + 1;
+        if used > limits.max_ops {
+            return Err(AmlError::LimitExceeded(Limit::Ops));
+        }
+        self.check_deadline()
+    }
+
+    /// Hardening: whether the current top-level call is still within its time (`Limits::max_call_ms`).
+    fn check_deadline(&self) -> Result<(), AmlError> {
+        if self.handler.nanos_since_boot() > self.deadline.load(Ordering::Acquire) {
+            Err(AmlError::LimitExceeded(Limit::Deadline))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Hardening: milliseconds left before the current call's deadline (a `Sleep` never sleeps past it).
+    fn ms_left(&self) -> u64 {
+        self.deadline.load(Ordering::Acquire).saturating_sub(self.handler.nanos_since_boot()) / 1_000_000
+    }
+
+    /// Hardening: the caller's context, if this top-level call pushed it (contexts below `base` belong to an outer call).
+    fn pop_context(&self, base: usize) -> Option<MethodContext> {
+        let mut stack = self.context_stack.lock();
+        if stack.len() > base { stack.pop() } else { None }
+    }
+
+    fn run_context(&self, context: &mut MethodContext, base: usize) -> Result<WrappedObject, AmlError> {
+        let limits = self.limits();
         /*
          * This is the main loop that executes operations. Every op is handled at the top-level of
          * the loop to prevent pathological stack growth from nested operations.
@@ -395,6 +678,11 @@ where
          * quirkier parts of the AML grammar, particularly the left-to-right encoding of operands.
          */
         loop {
+            // Hardening: every iteration counts against the top-level call's op budget, and the ops in flight are bounded.
+            self.count_op(&limits)?;
+            if context.in_flight.len() > limits.max_in_flight {
+                return Err(AmlError::LimitExceeded(Limit::InFlight));
+            }
             /*
              * First, see if we've gathered enough arguments to complete some in-flight operations.
              */
@@ -412,14 +700,18 @@ where
                     | Opcode::Or
                     | Opcode::Nor
                     | Opcode::Xor => {
-                        self.do_binary_maths(&mut context, op)?;
+                        self.do_binary_maths(context, op)?;
                     }
                     Opcode::Not | Opcode::FindSetLeftBit | Opcode::FindSetRightBit => {
-                        self.do_unary_maths(&mut context, op)?;
+                        self.do_unary_maths(context, op)?;
                     }
                     Opcode::Increment | Opcode::Decrement => {
-                        let [Argument::Object(operand)] = &op.arguments[..] else { panic!() };
+                        let [Argument::Object(operand)] = &op.arguments[..] else {
+                            return Err(AmlError::MalformedStream);
+                        };
                         let token = self.object_token.lock();
+                        // SAFETY: the object token is held, so no other context mutates objects, and this op holds
+                        // no other reference into `operand` while the integer is changed in place.
                         let Object::Integer(operand) = (unsafe { operand.gain_mut(&token) }) else {
                             Err(AmlError::ObjectNotOfExpectedType {
                                 expected: ObjectType::Integer,
@@ -427,10 +719,10 @@ where
                             })?
                         };
 
-                        let new_value = match op.op {
-                            Opcode::Increment => operand.wrapping_add(1),
-                            Opcode::Decrement => operand.wrapping_sub(1),
-                            _ => unreachable!(),
+                        let new_value = if op.op == Opcode::Increment {
+                            operand.wrapping_add(1)
+                        } else {
+                            operand.wrapping_sub(1)
                         };
 
                         *operand = new_value;
@@ -445,23 +737,22 @@ where
                     | Opcode::LEqual
                     | Opcode::LGreater
                     | Opcode::LLess => {
-                        self.do_logical_op(&mut context, op)?;
+                        self.do_logical_op(context, op)?;
                     }
-                    Opcode::ToBuffer => self.do_to_buffer(&mut context, op)?,
-                    Opcode::ToInteger => self.do_to_integer(&mut context, op)?,
-                    Opcode::ToString => self.do_to_string(&mut context, op)?,
-                    Opcode::ToDecimalString | Opcode::ToHexString => {
-                        self.do_to_dec_hex_string(&mut context, op)?
-                    }
-                    Opcode::Mid => self.do_mid(&mut context, op)?,
-                    Opcode::Concat => self.do_concat(&mut context, op)?,
+                    Opcode::ToBuffer => self.do_to_buffer(context, op)?,
+                    Opcode::ToInteger => self.do_to_integer(context, op)?,
+                    Opcode::ToString => self.do_to_string(context, op)?,
+                    Opcode::ToDecimalString | Opcode::ToHexString => self.do_to_dec_hex_string(context, op)?,
+                    Opcode::Mid => self.do_mid(context, op)?,
+                    Opcode::Concat => self.do_concat(context, op)?,
                     Opcode::ConcatRes => {
                         let [Argument::Object(source1), Argument::Object(source2), target] = &op.arguments[..]
                         else {
-                            panic!()
+                            return Err(AmlError::MalformedStream);
                         };
                         let source1 = source1.as_buffer()?;
                         let source2 = source2.as_buffer()?;
+                        self.check_size(source1.len().saturating_add(source2.len()).saturating_add(2))?;
                         let result = {
                             let mut buffer = Vec::from(source1);
                             buffer.extend_from_slice(source2);
@@ -478,7 +769,7 @@ where
                     }
                     Opcode::Reset => {
                         let [Argument::Object(sync_object)] = &op.arguments[..] else {
-                            panic!();
+                            return Err(AmlError::MalformedStream);
                         };
                         let sync_object = sync_object.clone().unwrap_reference();
 
@@ -493,7 +784,7 @@ where
                     }
                     Opcode::Signal => {
                         let [Argument::Object(sync_object)] = &op.arguments[..] else {
-                            panic!();
+                            return Err(AmlError::MalformedStream);
                         };
                         let sync_object = sync_object.clone().unwrap_reference();
 
@@ -508,10 +799,11 @@ where
                     }
                     Opcode::Wait => {
                         let [Argument::Object(sync_object), Argument::Object(timeout)] = &op.arguments[..] else {
-                            panic!();
+                            return Err(AmlError::MalformedStream);
                         };
                         let sync_object = sync_object.clone().unwrap_reference();
-                        let timeout = u64::min(timeout.as_integer()?, 0xffff);
+                        // Hardening: "forever" (0xffff) and every other timeout are bounded by `max_wait_ms`.
+                        let timeout = u64::min(timeout.as_integer()?, limits.max_wait_ms);
 
                         if let Object::Event(ref counter) = *sync_object {
                             /*
@@ -544,10 +836,8 @@ where
                                     }
                                 }
 
-                                let to_sleep = u64::min(timeout, 10);
-                                if timeout < 0xffff {
-                                    remaining_sleep -= to_sleep
-                                }
+                                let to_sleep = u64::min(remaining_sleep, 10);
+                                remaining_sleep -= to_sleep;
                                 self.handler.sleep(to_sleep);
                             }
 
@@ -561,11 +851,11 @@ where
                             });
                         }
                     }
-                    Opcode::FromBCD => self.do_from_bcd(&mut context, op)?,
-                    Opcode::ToBCD => self.do_to_bcd(&mut context, op)?,
+                    Opcode::FromBCD => self.do_from_bcd(context, op)?,
+                    Opcode::ToBCD => self.do_to_bcd(context, op)?,
                     Opcode::Name => {
                         let [Argument::Namestring(name), Argument::Object(object)] = &op.arguments[..] else {
-                            panic!()
+                            return Err(AmlError::MalformedStream);
                         };
 
                         let name = name.resolve(&context.current_scope)?;
@@ -576,11 +866,12 @@ where
                         let [Argument::ByteData(typ), Argument::DWordData(code), Argument::Object(arg)] =
                             &op.arguments[..]
                         else {
-                            panic!()
+                            return Err(AmlError::MalformedStream);
                         };
                         let arg = arg.as_integer()?;
                         self.handler.handle_fatal_error(*typ, *code, arg);
-                        context.retire_op(op);
+                        // Hardening: the firmware asked to stop: this evaluation ends with an error (the host decides).
+                        return Err(AmlError::FatalOpcode { typ: *typ, code: *code, arg });
                     }
                     Opcode::OpRegion => {
                         let [
@@ -590,7 +881,7 @@ where
                             Argument::Object(region_length),
                         ] = &op.arguments[..]
                         else {
-                            panic!()
+                            return Err(AmlError::MalformedStream);
                         };
 
                         let region_offset = region_offset.clone().unwrap_transparent_reference();
@@ -613,7 +904,7 @@ where
                             Argument::Object(oem_table_id),
                         ] = &op.arguments[..]
                         else {
-                            panic!()
+                            return Err(AmlError::MalformedStream);
                         };
                         let _signature = signature.as_string()?;
                         let _oem_id = oem_id.as_string()?;
@@ -640,25 +931,28 @@ where
                             Argument::Object(buffer_size),
                         ] = &op.arguments[..]
                         else {
-                            panic!()
+                            return Err(AmlError::MalformedStream);
                         };
                         let buffer_size = buffer_size.clone().unwrap_transparent_reference().as_integer()?;
 
-                        let buffer_len = pkg_length - (context.current_block.pc - start_pc);
-                        let mut buffer = vec![0; buffer_size as usize];
-                        buffer[0..buffer_len].copy_from_slice(
-                            &context.current_block.stream()
-                                [context.current_block.pc..(context.current_block.pc + buffer_len)],
-                        );
-                        context.current_block.pc += buffer_len;
+                        // Hardening: the size is checked before anything is allocated, the initializer is bounded by the
+                        // stream, and a longer initializer than the size makes the buffer that long (ACPI 19.6.10).
+                        let buffer_len = context.remaining(*start_pc, *pkg_length)?;
+                        let initializer = context.take(buffer_len)?;
+                        let buffer_size = usize::try_from(buffer_size).unwrap_or(usize::MAX).max(buffer_len);
+                        self.check_size(buffer_size)?;
+                        let mut buffer = vec![0; buffer_size];
+                        buffer[0..buffer_len].copy_from_slice(initializer);
 
                         context.contribute_arg(Argument::Object(Object::Buffer(buffer).wrap()));
                         context.retire_op(op);
                     }
                     Opcode::Package => {
-                        let mut elements = Vec::with_capacity(op.expected_arguments);
+                        let mut elements = Vec::with_capacity(op.arguments.len());
                         for arg in &op.arguments {
-                            let Argument::Object(object) = arg else { panic!() };
+                            let Argument::Object(object) = arg else {
+                                return Err(AmlError::MalformedStream);
+                            };
                             elements.push(object.clone());
                         }
 
@@ -673,20 +967,27 @@ where
                          * To make these consistent, we always remove the block here, making sure
                          * we've finished it as a sanity check.
                          */
-                        assert_eq!(context.current_block.kind, BlockKind::Package);
-                        assert_eq!(context.peek(), Err(AmlError::RunOutOfStream));
-                        context.current_block = context.block_stack.pop().unwrap();
+                        // Hardening: these were `assert!`s and an `unwrap`. A package whose block is not the current one is
+                        // malformed; bytes past its declared elements are skipped.
+                        if context.current_block.kind != BlockKind::Package {
+                            return Err(AmlError::MalformedStream);
+                        }
+                        context.pop_block()?;
                         context.contribute_arg(Argument::Object(Object::Package(elements).wrap()));
                         context.retire_op(op);
                     }
                     Opcode::VarPackage => {
-                        let Argument::Object(total_elements) = &op.arguments[0] else { panic!() };
-                        let total_elements =
-                            total_elements.clone().unwrap_transparent_reference().as_integer()? as usize;
+                        let Some(Argument::Object(total_elements)) = op.arguments.first() else {
+                            return Err(AmlError::MalformedStream);
+                        };
+                        let total_elements = total_elements.clone().unwrap_transparent_reference().as_integer()?;
+                        let total_elements = check_elements(&limits, total_elements)?;
 
                         let mut elements = Vec::with_capacity(total_elements);
-                        for arg in &op.arguments[1..] {
-                            let Argument::Object(object) = arg else { panic!() };
+                        for arg in op.arguments.iter().skip(1).take(total_elements) {
+                            let Argument::Object(object) = arg else {
+                                return Err(AmlError::MalformedStream);
+                            };
                             elements.push(object.clone());
                         }
 
@@ -694,9 +995,10 @@ where
                          * As above, we always remove the block here after the in-flight op has
                          * been retired.
                          */
-                        assert_eq!(context.current_block.kind, BlockKind::VarPackage);
-                        assert_eq!(context.peek(), Err(AmlError::RunOutOfStream));
-                        context.current_block = context.block_stack.pop().unwrap();
+                        if context.current_block.kind != BlockKind::VarPackage {
+                            return Err(AmlError::MalformedStream);
+                        }
+                        context.pop_block()?;
                         context.contribute_arg(Argument::Object(Object::Package(elements).wrap()));
                         context.retire_op(op);
                     }
@@ -707,15 +1009,15 @@ where
                             Argument::Object(predicate),
                         ] = &op.arguments[..]
                         else {
-                            panic!()
+                            return Err(AmlError::MalformedStream);
                         };
                         let predicate = predicate.as_integer()?;
-                        let remaining_then_length = then_length - (context.current_block.pc - start_pc);
+                        let remaining_then_length = context.remaining(*start_pc, *then_length)?;
 
                         if predicate > 0 {
-                            context.start_new_block(BlockKind::IfThenBranch, remaining_then_length);
+                            context.start_new_block(BlockKind::IfThenBranch, remaining_then_length, &limits)?;
                         } else {
-                            context.current_block.pc += remaining_then_length;
+                            context.skip(remaining_then_length)?;
 
                             /*
                              * Skip over the prolog to the else branch if present. Also handle if
@@ -741,21 +1043,27 @@ where
                     | opcode @ Opcode::CreateDWordField
                     | opcode @ Opcode::CreateQWordField => {
                         let [Argument::Object(buffer), Argument::Object(index)] = &op.arguments[..] else {
-                            panic!()
+                            return Err(AmlError::MalformedStream);
                         };
                         let name = context.namestring()?;
                         let index = index.as_integer()?;
-                        let (offset, length) = match opcode {
-                            Opcode::CreateBitField => (index, 1),
-                            Opcode::CreateByteField => (index * 8, 8),
-                            Opcode::CreateWordField => (index * 8, 16),
-                            Opcode::CreateDWordField => (index * 8, 32),
-                            Opcode::CreateQWordField => (index * 8, 64),
-                            _ => unreachable!(),
+                        // Hardening: `index * 8` could overflow; a field past the buffer is refused when it is created, and again when used.
+                        let length = match opcode {
+                            Opcode::CreateBitField => 1,
+                            Opcode::CreateByteField => 8,
+                            Opcode::CreateWordField => 16,
+                            Opcode::CreateDWordField => 32,
+                            _ => 64,
                         };
+                        let offset =
+                            if opcode == Opcode::CreateBitField { Some(index) } else { index.checked_mul(8) };
+                        let offset = offset
+                            .and_then(|offset| usize::try_from(offset).ok())
+                            .ok_or(AmlError::IndexOutOfBounds)?;
+                        field_in_buffer(buffer, offset, length)?;
                         self.namespace.lock().insert(
                             name.resolve(&context.current_scope)?,
-                            Object::BufferField { buffer: buffer.clone(), offset: offset as usize, length }.wrap(),
+                            Object::BufferField { buffer: buffer.clone(), offset, length }.wrap(),
                         )?;
                         context.retire_op(op);
                     }
@@ -763,37 +1071,43 @@ where
                         let [Argument::Object(buffer), Argument::Object(bit_index), Argument::Object(num_bits)] =
                             &op.arguments[..]
                         else {
-                            panic!()
+                            return Err(AmlError::MalformedStream);
                         };
                         let name = context.namestring()?;
-                        let bit_index = bit_index.as_integer()?;
-                        let num_bits = num_bits.as_integer()?;
+                        let bit_index =
+                            usize::try_from(bit_index.as_integer()?).map_err(|_| AmlError::IndexOutOfBounds)?;
+                        let num_bits =
+                            usize::try_from(num_bits.as_integer()?).map_err(|_| AmlError::IndexOutOfBounds)?;
+                        // Hardening: a field past its buffer (or of no bits) is refused when it is created.
+                        field_in_buffer(buffer, bit_index, num_bits)?;
 
                         self.namespace.lock().insert(
                             name.resolve(&context.current_scope)?,
-                            Object::BufferField {
-                                buffer: buffer.clone(),
-                                offset: bit_index as usize,
-                                length: num_bits as usize,
-                            }
-                            .wrap(),
+                            Object::BufferField { buffer: buffer.clone(), offset: bit_index, length: num_bits }
+                                .wrap(),
                         )?;
                         context.retire_op(op);
                     }
                     Opcode::Store => {
-                        let [Argument::Object(object), target] = &op.arguments[..] else { panic!() };
+                        let [Argument::Object(object), target] = &op.arguments[..] else {
+                            return Err(AmlError::MalformedStream);
+                        };
                         self.do_store(target, object.clone())?;
                         context.retire_op(op);
                     }
                     Opcode::RefOf => {
-                        let [Argument::Object(object)] = &op.arguments[..] else { panic!() };
+                        let [Argument::Object(object)] = &op.arguments[..] else {
+                            return Err(AmlError::MalformedStream);
+                        };
                         let reference =
                             Object::Reference { kind: ReferenceKind::RefOf, inner: object.clone() }.wrap();
                         context.contribute_arg(Argument::Object(reference));
                         context.retire_op(op);
                     }
                     Opcode::CondRefOf => {
-                        let [Argument::Object(object), target] = &op.arguments[..] else { panic!() };
+                        let [Argument::Object(object), target] = &op.arguments[..] else {
+                            return Err(AmlError::MalformedStream);
+                        };
                         let result = if let Object::Reference { kind: ReferenceKind::Unresolved, .. } = **object {
                             Object::Integer(0)
                         } else {
@@ -806,12 +1120,14 @@ where
                         context.retire_op(op);
                     }
                     Opcode::DerefOf => {
-                        let [Argument::Object(object)] = &op.arguments[..] else { panic!() };
-                        let result = if object.typ() == ObjectType::Reference {
+                        let [Argument::Object(object)] = &op.arguments[..] else {
+                            return Err(AmlError::MalformedStream);
+                        };
+                        // Hardening: `typ()` reports what a reference refers to, so a reference never matched here.
+                        let result = if let Object::Reference { .. } = **object {
                             object.clone().unwrap_reference()
                         } else if object.typ() == ObjectType::String {
-                            let path = AmlName::from_str(&object.as_string().unwrap())?
-                                .resolve(&context.current_scope)?;
+                            let path = AmlName::from_str(&object.as_string()?)?.resolve(&context.current_scope)?;
                             self.namespace.lock().get(path)?.clone()
                         } else {
                             return Err(AmlError::ObjectNotOfExpectedType {
@@ -823,17 +1139,25 @@ where
                         context.retire_op(op);
                     }
                     Opcode::Sleep => {
-                        let [Argument::Object(msec)] = &op.arguments[..] else { panic!() };
-                        self.handler.sleep(msec.as_integer()?);
+                        let [Argument::Object(msec)] = &op.arguments[..] else {
+                            return Err(AmlError::MalformedStream);
+                        };
+                        // Hardening: never past the call's deadline; the next op then ends the call.
+                        self.handler.sleep(u64::min(msec.as_integer()?, self.ms_left().saturating_add(1)));
+                        self.check_deadline()?;
                         context.retire_op(op);
                     }
                     Opcode::Stall => {
-                        let [Argument::Object(usec)] = &op.arguments[..] else { panic!() };
+                        let [Argument::Object(usec)] = &op.arguments[..] else {
+                            return Err(AmlError::MalformedStream);
+                        };
                         self.handler.stall(usec.as_integer()?);
                         context.retire_op(op);
                     }
                     Opcode::Acquire => {
-                        let [Argument::Object(mutex)] = &op.arguments[..] else { panic!() };
+                        let [Argument::Object(mutex)] = &op.arguments[..] else {
+                            return Err(AmlError::MalformedStream);
+                        };
                         let Object::Mutex { mutex, sync_level: _ } = **mutex else {
                             Err(AmlError::InvalidOperationOnObject { op: Operation::Acquire, typ: mutex.typ() })?
                         };
@@ -849,7 +1173,9 @@ where
                         context.retire_op(op);
                     }
                     Opcode::Release => {
-                        let [Argument::Object(mutex)] = &op.arguments[..] else { panic!() };
+                        let [Argument::Object(mutex)] = &op.arguments[..] else {
+                            return Err(AmlError::MalformedStream);
+                        };
                         let Object::Mutex { mutex, sync_level: _ } = **mutex else {
                             Err(AmlError::InvalidOperationOnObject { op: Operation::Release, typ: mutex.typ() })?
                         };
@@ -864,45 +1190,55 @@ where
                         context.retire_op(op);
                     }
                     Opcode::InternalMethodCall => {
-                        let [Argument::Object(method), Argument::Namestring(method_scope)] = &op.arguments[0..2]
+                        let [Argument::Object(method), Argument::Namestring(method_scope), ..] = &op.arguments[..]
                         else {
-                            panic!()
+                            return Err(AmlError::MalformedStream);
                         };
 
-                        let args = op.arguments[2..]
-                            .iter()
-                            .map(|arg| {
-                                if let Argument::Object(arg) = arg {
-                                    arg.clone()
-                                } else {
-                                    panic!();
-                                }
-                            })
-                            .collect();
+                        let mut args = Vec::with_capacity(op.arguments.len().saturating_sub(2));
+                        for arg in &op.arguments[2..] {
+                            let Argument::Object(arg) = arg else {
+                                return Err(AmlError::MalformedStream);
+                            };
+                            args.push(arg.clone());
+                        }
 
                         if let Object::Method { .. } = **method {
+                            // Hardening: bounded method nesting.
+                            if self.context_stack.lock().len() >= limits.max_depth {
+                                return Err(AmlError::LimitExceeded(Limit::MethodDepth));
+                            }
+                            let new_context =
+                                MethodContext::new_from_method(method.clone(), args, method_scope.clone())?;
                             self.namespace
                                 .lock()
                                 .add_level(method_scope.clone(), NamespaceLevelKind::MethodLocals)?;
-
-                            let new_context =
-                                MethodContext::new_from_method(method.clone(), args, method_scope.clone())?;
-                            let old_context = mem::replace(&mut context, new_context);
+                            let old_context = mem::replace(context, new_context);
                             self.context_stack.lock().push(old_context);
                             context.retire_op(op);
                         } else if let Object::NativeMethod { ref f, .. } = **method {
                             let result = f(&args)?;
                             context.contribute_arg(Argument::Object(result));
                         } else {
-                            panic!();
+                            return Err(AmlError::ObjectNotOfExpectedType {
+                                expected: ObjectType::Method,
+                                got: method.typ(),
+                            });
                         }
                     }
                     Opcode::Return => {
-                        let [Argument::Object(object)] = &op.arguments[..] else { panic!() };
+                        let [Argument::Object(object)] = &op.arguments[..] else {
+                            return Err(AmlError::MalformedStream);
+                        };
                         let object = object.clone().unwrap_transparent_reference();
 
-                        if let Some(last) = self.context_stack.lock().pop() {
-                            context = last;
+                        // Hardening: the returning method's level is removed (it used to stay behind), and only contexts
+                        // this call pushed are popped.
+                        if let Some(scope) = context.method_scope() {
+                            let _ = self.namespace.lock().remove_level(scope);
+                        }
+                        if let Some(last) = self.pop_context(base) {
+                            *context = last;
                             context.contribute_arg(Argument::Object(object.clone()));
                             context.retire_op(op);
                         } else {
@@ -914,7 +1250,9 @@ where
                         }
                     }
                     Opcode::ObjectType => {
-                        let [Argument::Object(object)] = &op.arguments[..] else { panic!() };
+                        let [Argument::Object(object)] = &op.arguments[..] else {
+                            return Err(AmlError::MalformedStream);
+                        };
                         // TODO: this should technically support scopes as well - this is less easy
                         // (they should return `0`)
                         let typ = match object.typ() {
@@ -935,15 +1273,15 @@ where
                             ObjectType::BufferField => 14,
                             // XXX: 15 is reserved
                             ObjectType::Debug => 16,
-                            ObjectType::Reference => panic!(),
-                            ObjectType::RawDataBuffer => todo!(),
+                            // Hardening: were `panic!()` and `todo!()`.
+                            ObjectType::Reference | ObjectType::RawDataBuffer => 0,
                         };
 
                         context.contribute_arg(Argument::Object(Object::Integer(typ).wrap()));
                         context.retire_op(op);
                     }
-                    Opcode::SizeOf => self.do_size_of(&mut context, op)?,
-                    Opcode::Index => self.do_index(&mut context, op)?,
+                    Opcode::SizeOf => self.do_size_of(context, op)?,
+                    Opcode::Index => self.do_index(context, op)?,
                     Opcode::BankField => {
                         let [
                             Argument::TrackedPc(start_pc),
@@ -953,7 +1291,7 @@ where
                             Argument::Object(bank_value),
                         ] = &op.arguments[..]
                         else {
-                            panic!()
+                            return Err(AmlError::MalformedStream);
                         };
                         let bank_value = bank_value.as_integer()?;
                         let field_flags = context.next()?;
@@ -966,7 +1304,7 @@ where
                         };
 
                         let kind = FieldUnitKind::Bank { region, bank, bank_value };
-                        self.parse_field_list(&mut context, kind, *start_pc, *pkg_length, field_flags)?;
+                        self.parse_field_list(context, kind, *start_pc, *pkg_length, field_flags)?;
                         context.retire_op(op);
                     }
                     Opcode::While => {
@@ -974,16 +1312,47 @@ where
                          * We've just evaluated the predicate for an iteration of a while loop. If
                          * false, skip over the rest of the loop, otherwise carry on.
                          */
-                        let [Argument::Object(predicate)] = &op.arguments[..] else { panic!() };
+                        let [Argument::Object(predicate)] = &op.arguments[..] else {
+                            return Err(AmlError::MalformedStream);
+                        };
                         let predicate = predicate.as_integer()?;
 
                         if predicate == 0 {
                             // Exit from the while loop by skipping out of the current block
-                            context.current_block = context.block_stack.pop().unwrap();
+                            context.pop_block()?;
                             context.retire_op(op);
                         }
                     }
-                    _ => panic!("Unexpected operation has created in-flight op!"),
+                    Opcode::Notify => {
+                        // Hardening: was the catch-all `panic!` below. The host hears of it with the object's resolved path.
+                        let [Argument::Object(_object), Argument::Object(value)] = &op.arguments[..] else {
+                            return Err(AmlError::MalformedStream);
+                        };
+                        let value = value.clone().unwrap_transparent_reference().as_integer()?;
+                        if let Some(path) = &op.target_name {
+                            self.handler.handle_notify(path, value);
+                        } else {
+                            warn!(
+                                "Notify({:#x}) of an object with no name (a local or an argument): not delivered",
+                                value
+                            );
+                        }
+                        context.retire_op(op);
+                    }
+                    Opcode::CopyObject => {
+                        // Hardening: was `todo!()`. Done as a store: the target takes the source's value.
+                        let [Argument::Object(object), target] = &op.arguments[..] else {
+                            return Err(AmlError::MalformedStream);
+                        };
+                        self.do_store(target, object.clone())?;
+                        context.contribute_arg(Argument::Object(object.clone()));
+                        context.retire_op(op);
+                    }
+                    other => {
+                        // Hardening: was `panic!("Unexpected operation has created in-flight op!")`.
+                        warn!("AML: an in-flight {:?} has no completion", other);
+                        return Err(AmlError::MalformedStream);
+                    }
                 }
             }
 
@@ -998,15 +1367,16 @@ where
                      * We've reached the end of the current block. What we should do about this
                      * depends on what type of block it was.
                      */
-                    match context.current_block.kind {
+                    // Hardening: a copy (the context is borrowed now).
+                    match context.current_block.kind.clone() {
                         BlockKind::Table => {
                             break Ok(Object::Uninitialized.wrap());
                         }
                         BlockKind::Method { method_scope } => {
                             self.namespace.lock().remove_level(method_scope)?;
 
-                            if let Some(prev_context) = self.context_stack.lock().pop() {
-                                context = prev_context;
+                            if let Some(prev_context) = self.pop_context(base) {
+                                *context = prev_context;
                                 continue;
                             } else {
                                 /*
@@ -1017,8 +1387,7 @@ where
                             }
                         }
                         BlockKind::Scope { old_scope } => {
-                            assert!(!context.block_stack.is_empty());
-                            context.current_block = context.block_stack.pop().unwrap();
+                            context.pop_block()?;
                             context.current_scope = old_scope;
                             // Go round the loop again to get the next opcode for the new block
                             continue;
@@ -1033,15 +1402,17 @@ where
                              * *distinct* uninitialized objects, and go round again to complete the
                              * in-flight op.
                              */
-                            assert!(!context.block_stack.is_empty());
-
-                            if let Some(package_op) = context.in_flight.last_mut()
-                                && package_op.op == Opcode::Package
-                            {
-                                let num_elements_left = package_op.expected_arguments - package_op.arguments.len();
-                                for _ in 0..num_elements_left {
-                                    package_op.arguments.push(Argument::Object(Object::Uninitialized.wrap()));
+                            // Hardening: was an `assert!`. If the last op in flight is not this package (an op inside it
+                            // is missing operands), the package is malformed: going round again looped forever.
+                            match context.in_flight.last_mut() {
+                                Some(package_op) if package_op.op == Opcode::Package => {
+                                    let num_elements_left =
+                                        package_op.expected_arguments.saturating_sub(package_op.arguments.len());
+                                    for _ in 0..num_elements_left {
+                                        package_op.arguments.push(Argument::Object(Object::Uninitialized.wrap()));
+                                    }
                                 }
+                                _ => return Err(AmlError::MalformedStream),
                             }
 
                             // XXX: don't remove the package's block. Refer to completion of
@@ -1049,34 +1420,32 @@ where
                             continue;
                         }
                         BlockKind::VarPackage => {
-                            assert!(!context.block_stack.is_empty());
-
-                            if let Some(package_op) = context.in_flight.last_mut()
-                                && package_op.op == Opcode::VarPackage
-                            {
-                                let num_elements_left = {
-                                    let Argument::Object(total_elements) = &package_op.arguments[0] else {
-                                        panic!()
+                            // Hardening: the count was mis-computed (the op never completed, and the loop never ended) and
+                            // could underflow; a missing count or a foreign op in flight is malformed.
+                            match context.in_flight.last_mut() {
+                                Some(package_op) if package_op.op == Opcode::VarPackage => {
+                                    let Some(Argument::Object(total_elements)) = package_op.arguments.first()
+                                    else {
+                                        return Err(AmlError::MalformedStream);
                                     };
                                     let total_elements =
-                                        total_elements.clone().unwrap_transparent_reference().as_integer()?
-                                            as usize;
-
-                                    // Update the expected number of arguments to terminate the in-flight op
+                                        total_elements.clone().unwrap_transparent_reference().as_integer()?;
+                                    let total_elements = check_elements(&limits, total_elements)?;
+                                    // The count, then exactly `total_elements` elements.
+                                    package_op.arguments.truncate(total_elements + 1);
+                                    while package_op.arguments.len() < total_elements + 1 {
+                                        package_op.arguments.push(Argument::Object(Object::Uninitialized.wrap()));
+                                    }
                                     package_op.expected_arguments = package_op.arguments.len();
-                                    total_elements - (package_op.arguments.len() - 1)
-                                };
-
-                                for _ in 0..num_elements_left {
-                                    package_op.arguments.push(Argument::Object(Object::Uninitialized.wrap()));
                                 }
+                                _ => return Err(AmlError::MalformedStream),
                             }
 
                             // As above, leave the package's block.
                             continue;
                         }
                         BlockKind::IfThenBranch => {
-                            context.current_block = context.block_stack.pop().unwrap();
+                            context.pop_block()?;
 
                             /*
                              * Check for an else-branch, and skip over it. We need to handle the
@@ -1089,8 +1458,8 @@ where
                                     context.next()?;
                                     let start_pc = context.current_block.pc;
                                     let else_length = context.pkglength()?;
-                                    context.current_block.pc +=
-                                        else_length - (context.current_block.pc - start_pc);
+                                    let remaining = context.remaining(start_pc, else_length)?;
+                                    context.skip(remaining)?;
                                 }
                                 Ok(_) => (),
                                 Err(AmlError::RunOutOfStream) => (),
@@ -1099,11 +1468,16 @@ where
 
                             continue;
                         }
-                        BlockKind::While { start_pc } => {
+                        BlockKind::While { start_pc, iterations } => {
                             /*
                              * Go round again, and create a new in-flight op to have a look at the
                              * predicate.
                              */
+                            // Hardening: bounded iterations per loop.
+                            if iterations >= limits.max_loop_iterations {
+                                return Err(AmlError::LimitExceeded(Limit::LoopIterations));
+                            }
+                            context.current_block.kind = BlockKind::While { start_pc, iterations: iterations + 1 };
                             context.current_block.pc = start_pc;
                             context.start(OpInFlight::new(Opcode::While, &[ResolveBehaviour::TermArg]));
                             continue;
@@ -1119,7 +1493,7 @@ where
                      * most places, but could also encode a `NullName` if we are expecting a
                      * `Target`.
                      */
-                    if context.last_op()?.resolve_behaviour() == ResolveBehaviour::Target {
+                    if context.last_op()?.resolve_behaviour()? == ResolveBehaviour::Target {
                         context.last_op()?.arguments.push(Argument::Null);
                     } else {
                         context.last_op()?.arguments.push(Argument::Object(Object::Integer(0).wrap()));
@@ -1160,11 +1534,14 @@ where
                 Opcode::StringPrefix => {
                     let str_start = context.current_block.pc;
                     while context.next()? != b'\0' {}
-                    // TODO: handle err
-                    let str = String::from(
-                        str::from_utf8(&context.current_block.stream()[str_start..(context.current_block.pc - 1)])
-                            .unwrap(),
-                    );
+                    // Hardening: not UTF-8 is an error, not a panic.
+                    let bytes = context
+                        .current_block
+                        .stream()
+                        .get(str_start..context.current_block.pc.saturating_sub(1))
+                        .ok_or(AmlError::MalformedStream)?;
+                    self.check_size(bytes.len())?;
+                    let str = String::from(str::from_utf8(bytes).map_err(|_| AmlError::MalformedStream)?);
                     context.last_op()?.arguments.push(Argument::Object(Object::String(str).wrap()));
                 }
                 Opcode::QWordPrefix => {
@@ -1176,13 +1553,13 @@ where
                     let pkg_length = context.pkglength()?;
                     let name = context.namestring()?;
 
-                    let remaining_length = pkg_length - (context.current_block.pc - start_pc);
+                    let remaining_length = context.remaining(start_pc, pkg_length)?;
 
                     let new_scope = name.resolve(&context.current_scope)?;
                     self.namespace.lock().add_level(new_scope.clone(), NamespaceLevelKind::Scope)?;
 
                     let old_scope = mem::replace(&mut context.current_scope, new_scope);
-                    context.start_new_block(BlockKind::Scope { old_scope }, remaining_length);
+                    context.start_new_block(BlockKind::Scope { old_scope }, remaining_length, &limits)?;
                 }
                 Opcode::Buffer => {
                     let start_pc = context.current_block.pc;
@@ -1198,7 +1575,8 @@ where
                     let pkg_length = context.pkglength()?;
                     let num_elements = context.next()?;
 
-                    let remaining_length = pkg_length - (context.current_block.pc - start_pc);
+                    let remaining_length = context.remaining(start_pc, pkg_length)?;
+                    check_elements(&limits, num_elements as u64)?;
 
                     /*
                      * We now need to interpret an arbitrary number of package elements, bounded by
@@ -1212,12 +1590,12 @@ where
                         num_elements as usize,
                         &[ResolveBehaviour::AsPackageElements],
                     ));
-                    context.start_new_block(BlockKind::Package, remaining_length);
+                    context.start_new_block(BlockKind::Package, remaining_length, &limits)?;
                 }
                 Opcode::VarPackage => {
                     let start_pc = context.current_block.pc;
                     let pkg_length = context.pkglength()?;
-                    let remaining_length = pkg_length - (context.current_block.pc - start_pc);
+                    let remaining_length = context.remaining(start_pc, pkg_length)?;
 
                     /*
                      * For variable packages, we're first going to parse a `TermArg` that encodes,
@@ -1230,7 +1608,7 @@ where
                         usize::MAX,
                         &[ResolveBehaviour::TermArg, ResolveBehaviour::AsPackageElements],
                     ));
-                    context.start_new_block(BlockKind::VarPackage, remaining_length);
+                    context.start_new_block(BlockKind::VarPackage, remaining_length, &limits)?;
                 }
                 Opcode::Method => {
                     let start_pc = context.current_block.pc;
@@ -1238,11 +1616,8 @@ where
                     let name = context.namestring()?;
                     let flags = MethodFlags(context.next()?);
 
-                    let code_len = pkg_length - (context.current_block.pc - start_pc);
-                    let code = context.current_block.stream()
-                        [context.current_block.pc..(context.current_block.pc + code_len)]
-                        .to_vec();
-                    context.current_block.pc += code_len;
+                    let code_len = context.remaining(start_pc, pkg_length)?;
+                    let code = context.take(code_len)?.to_vec();
 
                     let name = name.resolve(&context.current_scope)?;
                     self.namespace.lock().insert(name, Object::Method { code, flags }.wrap())?;
@@ -1266,8 +1641,9 @@ where
                     let name = name.resolve(&context.current_scope)?;
                     self.namespace.lock().insert(name, Object::Event(Arc::new(AtomicU64::new(0))).wrap())?;
                 }
-                Opcode::LoadTable => todo!(),
-                Opcode::Load => todo!(),
+                // Hardening: were `todo!()`. Loading tables at run time is not supported: the method fails.
+                Opcode::LoadTable => return Err(AmlError::Unsupported("LoadTable")),
+                Opcode::Load => return Err(AmlError::Unsupported("Load")),
                 Opcode::Stall => context.start(OpInFlight::new(Opcode::Stall, &[ResolveBehaviour::TermArg])),
                 Opcode::Sleep => context.start(OpInFlight::new(Opcode::Sleep, &[ResolveBehaviour::TermArg])),
                 Opcode::Acquire => context.start(OpInFlight::new(opcode, &[ResolveBehaviour::SuperName])),
@@ -1336,7 +1712,7 @@ where
 
                     let region = self.namespace.lock().get(region_name.resolve(&context.current_scope)?)?.clone();
                     let kind = FieldUnitKind::Normal { region };
-                    self.parse_field_list(&mut context, kind, start_pc, pkg_length, field_flags)?;
+                    self.parse_field_list(context, kind, start_pc, pkg_length, field_flags)?;
                 }
                 Opcode::BankField => {
                     let start_pc = context.current_block.pc;
@@ -1375,27 +1751,28 @@ where
                         (index, data)
                     };
                     let kind = FieldUnitKind::Index { index, data };
-                    self.parse_field_list(&mut context, kind, start_pc, pkg_length, field_flags)?;
+                    self.parse_field_list(context, kind, start_pc, pkg_length, field_flags)?;
                 }
                 Opcode::Device | Opcode::ThermalZone => {
                     let start_pc = context.current_block.pc;
                     let pkg_length = context.pkglength()?;
                     let name = context.namestring()?;
 
-                    let remaining_length = pkg_length - (context.current_block.pc - start_pc);
+                    let remaining_length = context.remaining(start_pc, pkg_length)?;
 
                     let new_scope = name.resolve(&context.current_scope)?;
-                    let (kind, object) = match opcode {
-                        Opcode::Device => (NamespaceLevelKind::Device, Object::Device),
-                        Opcode::ThermalZone => (NamespaceLevelKind::ThermalZone, Object::ThermalZone),
-                        _ => unreachable!(),
+                    let (kind, object) = if opcode == Opcode::Device {
+                        (NamespaceLevelKind::Device, Object::Device)
+                    } else {
+                        (NamespaceLevelKind::ThermalZone, Object::ThermalZone)
                     };
                     let mut namespace = self.namespace.lock();
                     namespace.add_level(new_scope.clone(), kind)?;
                     namespace.insert(new_scope.clone(), object.wrap())?;
 
                     let old_scope = mem::replace(&mut context.current_scope, new_scope);
-                    context.start_new_block(BlockKind::Scope { old_scope }, remaining_length);
+                    drop(namespace);
+                    context.start_new_block(BlockKind::Scope { old_scope }, remaining_length, &limits)?;
                 }
                 Opcode::Processor => {
                     let start_pc = context.current_block.pc;
@@ -1405,7 +1782,7 @@ where
                     let pblk_address = context.next_u32()?;
                     let pblk_length = context.next()?;
 
-                    let remaining_length = pkg_length - (context.current_block.pc - start_pc);
+                    let remaining_length = context.remaining(start_pc, pkg_length)?;
 
                     let new_scope = name.resolve(&context.current_scope)?;
                     let object = Object::Processor { proc_id, pblk_address, pblk_length };
@@ -1414,7 +1791,8 @@ where
                     namespace.insert(new_scope.clone(), object.wrap())?;
 
                     let old_scope = mem::replace(&mut context.current_scope, new_scope);
-                    context.start_new_block(BlockKind::Scope { old_scope }, remaining_length);
+                    drop(namespace);
+                    context.start_new_block(BlockKind::Scope { old_scope }, remaining_length, &limits)?;
                 }
                 Opcode::PowerRes => {
                     let start_pc = context.current_block.pc;
@@ -1423,7 +1801,7 @@ where
                     let system_level = context.next()?;
                     let resource_order = context.next_u16()?;
 
-                    let remaining_length = pkg_length - (context.current_block.pc - start_pc);
+                    let remaining_length = context.remaining(start_pc, pkg_length)?;
 
                     let new_scope = name.resolve(&context.current_scope)?;
                     let object = Object::PowerResource { system_level, resource_order };
@@ -1432,7 +1810,8 @@ where
                     namespace.insert(new_scope.clone(), object.wrap())?;
 
                     let old_scope = mem::replace(&mut context.current_scope, new_scope);
-                    context.start_new_block(BlockKind::Scope { old_scope }, remaining_length);
+                    drop(namespace);
+                    context.start_new_block(BlockKind::Scope { old_scope }, remaining_length, &limits)?;
                 }
                 Opcode::Local(local) => {
                     let local = context.locals[local as usize].clone();
@@ -1465,18 +1844,22 @@ where
                     context.current_block.pc -= 1;
                     let name = context.namestring()?;
 
-                    let behaviour = context
-                        .in_flight
-                        .last()
-                        .map(|op| op.resolve_behaviour())
-                        .unwrap_or(ResolveBehaviour::TermArg);
+                    let behaviour = match context.in_flight.last() {
+                        Some(op) => op.resolve_behaviour()?,
+                        None => ResolveBehaviour::TermArg,
+                    };
                     match behaviour {
                         // XXX: `NullName` is handled separately given its ambiguity with `Zero`
                         ResolveBehaviour::SuperName | ResolveBehaviour::Target => {
                             let object = self.namespace.lock().search(&name, &context.current_scope);
                             match object {
-                                Ok((_resolved_name, object)) => {
-                                    context.last_op()?.arguments.push(Argument::Object(object));
+                                Ok((resolved_name, object)) => {
+                                    let op = context.last_op()?;
+                                    // Hardening: `Notify` hands the host the object's resolved path.
+                                    if op.op == Opcode::Notify && op.arguments.is_empty() {
+                                        op.target_name = Some(resolved_name);
+                                    }
+                                    op.arguments.push(Argument::Object(object));
                                 }
                                 Err(err) => Err(err)?,
                             }
@@ -1537,9 +1920,8 @@ where
                                 .arguments
                                 .push(Argument::Object(Object::String(name.to_string()).wrap()));
                         }
-                        ResolveBehaviour::Placeholder => {
-                            panic!("Invalid resolve behaviour for name to be resolved!")
-                        }
+                        // Hardening: was `panic!`.
+                        ResolveBehaviour::Placeholder => return Err(AmlError::MalformedStream),
                     }
                 }
 
@@ -1595,7 +1977,8 @@ where
                  * internal in-flight ops to parse the static bytedatas as we go, and then retire
                  * the real op at the end.
                  */
-                Opcode::Match => todo!(),
+                // Hardening: was `todo!()`.
+                Opcode::Match => return Err(AmlError::Unsupported("Match")),
 
                 Opcode::CreateBitField
                 | Opcode::CreateByteField
@@ -1629,7 +2012,11 @@ where
                 )),
 
                 Opcode::ObjectType => context.start(OpInFlight::new(opcode, &[ResolveBehaviour::SuperName])),
-                Opcode::CopyObject => todo!(),
+                // Hardening: was `todo!()`; done as a store (see its completion).
+                Opcode::CopyObject => context.start(OpInFlight::new(
+                    Opcode::CopyObject,
+                    &[ResolveBehaviour::TermArg, ResolveBehaviour::SuperName],
+                )),
                 Opcode::Mid => context.start(OpInFlight::new(
                     Opcode::Mid,
                     &[
@@ -1652,41 +2039,43 @@ where
                 Opcode::While => {
                     let start_pc = context.current_block.pc;
                     let pkg_length = context.pkglength()?;
-                    let remaining_length = pkg_length - (context.current_block.pc - start_pc);
+                    let remaining_length = context.remaining(start_pc, pkg_length)?;
                     context.start_new_block(
-                        BlockKind::While { start_pc: context.current_block.pc },
+                        BlockKind::While { start_pc: context.current_block.pc, iterations: 0 },
                         remaining_length,
-                    );
+                        &limits,
+                    )?;
                     context.start(OpInFlight::new(Opcode::While, &[ResolveBehaviour::TermArg]));
                 }
                 Opcode::Continue => {
-                    if let BlockKind::While { start_pc } = &context.current_block.kind {
-                        context.current_block.pc = *start_pc;
-                    } else {
-                        loop {
-                            let Some(block) = context.block_stack.pop() else {
-                                Err(AmlError::ContinueOutsideOfWhile)?
-                            };
-                            if let BlockKind::While { start_pc } = block.kind {
-                                context.current_block.pc = start_pc;
-                                break;
+                    // Hardening: the loop's own block becomes current again (the inner block's pc was moved instead),
+                    // and a `Continue` counts as an iteration.
+                    loop {
+                        if let BlockKind::While { start_pc, iterations } = context.current_block.kind {
+                            if iterations >= limits.max_loop_iterations {
+                                return Err(AmlError::LimitExceeded(Limit::LoopIterations));
                             }
+                            context.current_block.kind = BlockKind::While { start_pc, iterations: iterations + 1 };
+                            context.current_block.pc = start_pc;
+                            break;
                         }
+                        if context.block_stack.is_empty() {
+                            Err(AmlError::ContinueOutsideOfWhile)?
+                        }
+                        context.pop_block()?;
                     }
                     context.start(OpInFlight::new(Opcode::While, &[ResolveBehaviour::TermArg]));
                 }
                 Opcode::Break => {
-                    if let BlockKind::While { .. } = &context.current_block.kind {
-                        context.current_block = context.block_stack.pop().unwrap();
-                    } else {
-                        loop {
-                            let Some(block) = context.block_stack.pop() else {
-                                Err(AmlError::BreakOutsideOfWhile)?
-                            };
-                            if let BlockKind::While { .. } = block.kind {
-                                context.current_block = context.block_stack.pop().unwrap();
-                                break;
-                            }
+                    // Hardening: were `unwrap`s.
+                    loop {
+                        let in_while = matches!(context.current_block.kind, BlockKind::While { .. });
+                        if !in_while && context.block_stack.is_empty() {
+                            Err(AmlError::BreakOutsideOfWhile)?
+                        }
+                        context.pop_block()?;
+                        if in_while {
+                            break;
                         }
                     }
                 }
@@ -1699,7 +2088,8 @@ where
                     context.last_op()?.arguments.push(Argument::Object(Object::Integer(u64::MAX).wrap()));
                 }
 
-                Opcode::InternalMethodCall => panic!(),
+                // Hardening: was `panic!()`; never decoded from a stream.
+                Opcode::InternalMethodCall => return Err(AmlError::MalformedStream),
             }
         }
     }
@@ -1717,13 +2107,16 @@ where
         const CONNECT_FIELD: u8 = 0x02;
         const EXTENDED_ACCESS_FIELD: u8 = 0x03;
 
-        let mut field_offset = 0;
+        let mut field_offset: usize = 0;
+        // Hardening: `AccessAs` changes the access type of the fields after it.
+        let mut flags = flags;
+        let end = start_pc.saturating_add(pkg_length);
 
-        while context.current_block.pc < (start_pc + pkg_length) {
+        while context.current_block.pc < end {
             match context.next()? {
                 RESERVED_FIELD => {
                     let length = context.pkglength()?;
-                    field_offset += length;
+                    field_offset = field_offset.checked_add(length).ok_or(AmlError::MalformedStream)?;
                 }
                 ACCESS_FIELD => {
                     /*
@@ -1731,17 +2124,35 @@ where
                      * elements. They change the access type and attributes for remaining fields in
                      * the list.
                      */
-                    let _access_type = context.next()?;
+                    // Hardening: was `todo!()`. The access type replaces the low nibble of the flags; the attribute (an
+                    // SMBus or GenericSerialBus protocol) is not used.
+                    let access_type = context.next()?;
                     let _access_attrib = context.next()?;
-                    todo!()
+                    flags = (flags & 0xf0) | (access_type & 0x0f);
                 }
                 CONNECT_FIELD => {
-                    // TODO: either consume a namestring or `BufferData` (it's not
-                    // clear what a buffer data acc is lmao)
-                    todo!("Connect field :(");
+                    // Hardening: was `todo!()`. `Connection(...)` names the GPIO or serial bus resource of the fields
+                    // after it: a NameString or a buffer. It is consumed; such fields need a handler for their
+                    // space (GeneralPurposeIo or GenericSerialBus), which is given the region only.
+                    match context.peek()? {
+                        0x11 => {
+                            context.next()?;
+                            let start = context.current_block.pc;
+                            let length = context.pkglength()?;
+                            let remaining = context.remaining(start, length)?;
+                            context.skip(remaining)?;
+                        }
+                        _ => {
+                            context.namestring()?;
+                        }
+                    }
                 }
                 EXTENDED_ACCESS_FIELD => {
-                    todo!("Extended access field :(");
+                    // Hardening: was `todo!()`. Access type, attribute and length: the type is used as for `AccessAs`.
+                    let access_type = context.next()?;
+                    let _access_attrib = context.next()?;
+                    let _access_length = context.next()?;
+                    flags = (flags & 0xf0) | (access_type & 0x0f);
                 }
                 _ => {
                     context.current_block.pc -= 1;
@@ -1757,7 +2168,7 @@ where
                     });
                     self.namespace.lock().insert(field_name.resolve(&context.current_scope)?, field.wrap())?;
 
-                    field_offset += field_length;
+                    field_offset = field_offset.checked_add(field_length).ok_or(AmlError::MalformedStream)?;
                 }
             }
         }
@@ -1766,8 +2177,10 @@ where
     }
 
     fn do_binary_maths(&self, context: &mut MethodContext, op: OpInFlight) -> Result<(), AmlError> {
-        let [Argument::Object(left), Argument::Object(right), target] = &op.arguments[0..3] else { panic!() };
-        let target2 = if op.op == Opcode::Divide { Some(&op.arguments[3]) } else { None };
+        let [Argument::Object(left), Argument::Object(right), target, ..] = &op.arguments[..] else {
+            return Err(AmlError::MalformedStream);
+        };
+        let target2 = if op.op == Opcode::Divide { op.arguments.get(3) } else { None };
 
         let left = left.clone().unwrap_transparent_reference().as_integer()?;
         let right = right.clone().unwrap_transparent_reference().as_integer()?;
@@ -1776,21 +2189,26 @@ where
             Opcode::Add => left.wrapping_add(right),
             Opcode::Subtract => left.wrapping_sub(right),
             Opcode::Multiply => left.wrapping_mul(right),
+            // Hardening: a zero divisor was a panic.
             Opcode::Divide => {
+                if right == 0 {
+                    return Err(AmlError::DivideByZero);
+                }
                 if let Some(remainder) = target2 {
                     self.do_store(remainder, Object::Integer(left.wrapping_rem(right)).wrap())?;
                 }
                 left.wrapping_div_euclid(right)
             }
-            Opcode::ShiftLeft => left.wrapping_shl(right as u32),
-            Opcode::ShiftRight => left.wrapping_shr(right as u32),
-            Opcode::Mod => left.wrapping_rem(right),
+            // Hardening: a shift of 64 or more is zero (it used to wrap the count).
+            Opcode::ShiftLeft => u32::try_from(right).ok().and_then(|r| left.checked_shl(r)).unwrap_or(0),
+            Opcode::ShiftRight => u32::try_from(right).ok().and_then(|r| left.checked_shr(r)).unwrap_or(0),
+            Opcode::Mod => left.checked_rem(right).ok_or(AmlError::DivideByZero)?,
             Opcode::Nand => !(left & right),
             Opcode::And => left & right,
             Opcode::Or => left | right,
             Opcode::Nor => !(left | right),
             Opcode::Xor => left ^ right,
-            _ => panic!(),
+            _ => return Err(AmlError::MalformedStream),
         };
 
         let result = Object::Integer(result).wrap();
@@ -1801,7 +2219,10 @@ where
     }
 
     fn do_unary_maths(&self, context: &mut MethodContext, op: OpInFlight) -> Result<(), AmlError> {
-        let [Argument::Object(operand)] = &op.arguments[..] else { panic!() };
+        // Hardening: `Not` and the bit finders take a target too; only the operand is used here.
+        let Some(Argument::Object(operand)) = op.arguments.first() else {
+            return Err(AmlError::MalformedStream);
+        };
         let operand = operand.clone().unwrap_transparent_reference().as_integer()?;
 
         let result = match op.op {
@@ -1834,17 +2255,24 @@ where
                     0
                 }
             }
-            _ => panic!(),
+            _ => return Err(AmlError::MalformedStream),
         };
 
-        context.contribute_arg(Argument::Object(Object::Integer(result).wrap()));
+        // Hardening: the target was never stored to (and the pattern with it present always failed).
+        let result = match op.arguments.get(1) {
+            Some(target) => self.do_store(target, Object::Integer(result).wrap())?,
+            None => Object::Integer(result).wrap(),
+        };
+        context.contribute_arg(Argument::Object(result));
         context.retire_op(op);
         Ok(())
     }
 
     fn do_logical_op(&self, context: &mut MethodContext, op: OpInFlight) -> Result<(), AmlError> {
         if op.op == Opcode::LNot {
-            let [Argument::Object(operand)] = &op.arguments[..] else { panic!() };
+            let [Argument::Object(operand)] = &op.arguments[..] else {
+                return Err(AmlError::MalformedStream);
+            };
             let operand = operand.clone().unwrap_transparent_reference().as_integer()?;
             let result = if operand == 0 { u64::MAX } else { 0 };
 
@@ -1853,7 +2281,9 @@ where
             return Ok(());
         }
 
-        let [Argument::Object(left), Argument::Object(right)] = &op.arguments[..] else { panic!() };
+        let [Argument::Object(left), Argument::Object(right)] = &op.arguments[..] else {
+            return Err(AmlError::MalformedStream);
+        };
         let left = left.clone().unwrap_transparent_reference();
         let right = right.clone().unwrap_transparent_reference();
 
@@ -1883,18 +2313,15 @@ where
                 (left, right)
             }
             Object::Buffer(ref left) => {
-                let Object::Buffer(ref right) = *right else { panic!() };
-                let left = {
-                    let mut bytes = [0u8; 4];
-                    (bytes[0..left.len()]).copy_from_slice(left);
-                    u32::from_le_bytes(bytes) as u64
+                // Hardening: a buffer longer than four bytes, or a right side that is no buffer, were panics.
+                let right = right.to_buffer(if self.dsdt_revision >= 2 { 8 } else { 4 })?;
+                let first4 = |bytes: &[u8]| {
+                    let mut out = [0u8; 4];
+                    let n = usize::min(4, bytes.len());
+                    out[..n].copy_from_slice(&bytes[..n]);
+                    u32::from_le_bytes(out) as u64
                 };
-                let right = {
-                    let mut bytes = [0u8; 4];
-                    (bytes[0..right.len()]).copy_from_slice(right);
-                    u32::from_le_bytes(bytes) as u64
-                };
-                (left, right)
+                (first4(left), first4(&right))
             }
             _ => Err(AmlError::InvalidOperationOnObject { op: Operation::LogicalOp, typ: left.typ() })?,
         };
@@ -1908,7 +2335,7 @@ where
             Opcode::LEqual => left == right,
             Opcode::LGreater => left > right,
             Opcode::LLess => left < right,
-            _ => panic!(),
+            _ => return Err(AmlError::MalformedStream),
         };
         let result = if result { Object::Integer(u64::MAX) } else { Object::Integer(0) };
 
@@ -1918,7 +2345,9 @@ where
     }
 
     fn do_to_buffer(&self, context: &mut MethodContext, op: OpInFlight) -> Result<(), AmlError> {
-        let [Argument::Object(operand), target] = &op.arguments[..] else { panic!() };
+        let [Argument::Object(operand), target] = &op.arguments[..] else {
+            return Err(AmlError::MalformedStream);
+        };
         let operand = operand.clone().unwrap_transparent_reference();
 
         let result = match *operand {
@@ -1951,7 +2380,9 @@ where
     }
 
     fn do_to_integer(&self, context: &mut MethodContext, op: OpInFlight) -> Result<(), AmlError> {
-        let [Argument::Object(operand), target] = &op.arguments[..] else { panic!() };
+        let [Argument::Object(operand), target] = &op.arguments[..] else {
+            return Err(AmlError::MalformedStream);
+        };
         let operand = operand.clone().unwrap_transparent_reference();
 
         let result = match *operand {
@@ -1996,25 +2427,22 @@ where
     }
 
     fn do_to_string(&self, context: &mut MethodContext, op: OpInFlight) -> Result<(), AmlError> {
-        let [Argument::Object(source), Argument::Object(length), target] = &op.arguments[..] else { panic!() };
+        let [Argument::Object(source), Argument::Object(length), target] = &op.arguments[..] else {
+            return Err(AmlError::MalformedStream);
+        };
         let source = source.clone().unwrap_transparent_reference();
         let source = source.as_buffer()?;
-        let length = length.clone().unwrap_transparent_reference().as_integer()? as usize;
+        let length =
+            usize::try_from(length.clone().unwrap_transparent_reference().as_integer()?).unwrap_or(usize::MAX);
 
-        let result = if source.is_empty() {
-            Object::String(String::new())
-        } else {
-            let mut buffer = source.split_inclusive(|b| *b == b'\0').next().unwrap();
-            if length < usize::MAX {
-                buffer = &buffer[0..usize::min(length, buffer.len())];
-            }
-            let string = str::from_utf8(buffer).map_err(|_| AmlError::InvalidOperationOnObject {
-                op: Operation::ToString,
-                typ: ObjectType::Buffer,
-            })?;
-            Object::String(string.to_string())
-        }
-        .wrap();
+        // Hardening: up to the first NUL, not including it (it was included), with no `unwrap`.
+        let bytes = source.split(|b| *b == b'\0').next().unwrap_or(&[]);
+        let bytes = &bytes[..usize::min(length, bytes.len())];
+        let string = str::from_utf8(bytes).map_err(|_| AmlError::InvalidOperationOnObject {
+            op: Operation::ToString,
+            typ: ObjectType::Buffer,
+        })?;
+        let result = Object::String(string.to_string()).wrap();
 
         let result = self.do_store(target, result)?;
         context.contribute_arg(Argument::Object(result));
@@ -2024,35 +2452,35 @@ where
 
     /// Perform a `ToDecimalString` or `ToHexString` operation
     fn do_to_dec_hex_string(&self, context: &mut MethodContext, op: OpInFlight) -> Result<(), AmlError> {
-        let [Argument::Object(operand), target] = &op.arguments[..] else { panic!() };
+        let [Argument::Object(operand), target] = &op.arguments[..] else {
+            return Err(AmlError::MalformedStream);
+        };
         let operand = operand.clone().unwrap_transparent_reference();
+        let decimal = op.op == Opcode::ToDecimalString;
 
         let result = match *operand {
             Object::String(ref value) => Object::String(value.clone()),
-            Object::Integer(value) => match op.op {
-                Opcode::ToDecimalString => Object::String(value.to_string()),
-                Opcode::ToHexString => Object::String(alloc::format!("{value:#x}")),
-                _ => panic!(),
-            },
-            Object::Buffer(ref bytes) => {
-                if bytes.is_empty() {
-                    Object::String(String::new())
+            Object::Integer(value) => {
+                if decimal {
+                    Object::String(value.to_string())
                 } else {
-                    let mut string = String::new();
-                    for byte in bytes {
-                        let as_str = match op.op {
-                            Opcode::ToDecimalString => alloc::format!("{byte},"),
-                            Opcode::ToHexString => alloc::format!("{byte:#04X},"),
-                            _ => panic!(),
-                        };
-                        string.push_str(&as_str);
-                    }
-                    // Remove last comma, if present
-                    if !string.is_empty() {
-                        string.pop();
-                    }
-                    Object::String(string)
+                    Object::String(alloc::format!("{value:#x}"))
                 }
+            }
+            Object::Buffer(ref bytes) => {
+                // Hardening: each byte becomes up to five characters: bounded before it is built.
+                self.check_size(bytes.len().saturating_mul(5))?;
+                let mut string = String::new();
+                for byte in bytes {
+                    if decimal {
+                        string.push_str(&alloc::format!("{byte},"));
+                    } else {
+                        string.push_str(&alloc::format!("{byte:#04X},"));
+                    }
+                }
+                // Remove last comma, if present
+                string.pop();
+                Object::String(string)
             }
             _ => Err(AmlError::InvalidOperationOnObject { op: Operation::ToDecOrHexString, typ: operand.typ() })?,
         }
@@ -2068,30 +2496,23 @@ where
         let [Argument::Object(source), Argument::Object(index), Argument::Object(length), target] =
             &op.arguments[..]
         else {
-            panic!()
+            return Err(AmlError::MalformedStream);
         };
-        let index = index.clone().unwrap_transparent_reference().as_integer()? as usize;
-        let length = length.clone().unwrap_transparent_reference().as_integer()? as usize;
+        let index =
+            usize::try_from(index.clone().unwrap_transparent_reference().as_integer()?).unwrap_or(usize::MAX);
+        let length =
+            usize::try_from(length.clone().unwrap_transparent_reference().as_integer()?).unwrap_or(usize::MAX);
+        // Hardening: the end was `min(index + length, index + len)` (past the end, and an overflow); it is `len` at most,
+        // and a string is cut on bytes, never inside a character.
+        let range = |len: usize| index.min(len)..index.saturating_add(length).min(len);
 
-        let result = match **source {
+        let source = source.clone().unwrap_transparent_reference();
+        let result = match *source {
             Object::String(ref string) => {
-                if index >= string.len() {
-                    Object::String(String::new())
-                } else {
-                    let upper = usize::min(index + length, index + string.len());
-                    let chars = &string[index..upper];
-                    Object::String(String::from(chars))
-                }
+                let bytes = &string.as_bytes()[range(string.len())];
+                Object::String(String::from_utf8_lossy(bytes).into_owned())
             }
-            Object::Buffer(ref buffer) => {
-                if index >= buffer.len() {
-                    Object::Buffer(vec![])
-                } else {
-                    let upper = usize::min(index + length, index + buffer.len());
-                    let bytes = &buffer[index..upper];
-                    Object::Buffer(bytes.to_vec())
-                }
-            }
+            Object::Buffer(ref buffer) => Object::Buffer(buffer[range(buffer.len())].to_vec()),
             _ => Err(AmlError::InvalidOperationOnObject { op: Operation::Mid, typ: source.typ() })?,
         }
         .wrap();
@@ -2103,7 +2524,9 @@ where
     }
 
     fn do_concat(&self, context: &mut MethodContext, op: OpInFlight) -> Result<(), AmlError> {
-        let [Argument::Object(source1), Argument::Object(source2), target] = &op.arguments[..] else { panic!() };
+        let [Argument::Object(source1), Argument::Object(source2), target] = &op.arguments[..] else {
+            return Err(AmlError::MalformedStream);
+        };
         let source1 = source1.clone().unwrap_transparent_reference();
         let source2 = source2.clone().unwrap_transparent_reference();
 
@@ -2118,23 +2541,25 @@ where
                 Object::Integer(value) => value.to_string(),
                 Object::Method { .. } | Object::NativeMethod { .. } => "[Control Method]".to_string(),
                 Object::Mutex { .. } => "[Mutex]".to_string(),
-                Object::Reference { inner, .. } => resolve_as_string(&(inner.clone().unwrap_reference())),
+                // Hardening: no recursion through references (a cycle recursed forever).
+                Object::Reference { .. } => "[Reference]".to_string(),
                 Object::OpRegion(_) => "[Operation Region]".to_string(),
                 Object::Package(_) => "[Package]".to_string(),
                 Object::PowerResource { .. } => "[Power Resource]".to_string(),
                 Object::Processor { .. } => "[Processor]".to_string(),
-                // TODO: what even is one of these??
-                Object::RawDataBuffer => todo!(),
+                // Hardening: was `todo!()`.
+                Object::RawDataBuffer => "[Raw Data Buffer]".to_string(),
                 Object::String(value) => value.clone(),
                 Object::ThermalZone => "[Thermal Zone]".to_string(),
                 Object::Debug => "[Debug Object]".to_string(),
             }
         }
 
+        let width = if self.dsdt_revision >= 2 { 8 } else { 4 };
         let result = match source1.typ() {
             ObjectType::Integer => {
                 let source1 = source1.as_integer()?;
-                let source2 = source2.to_integer(if self.dsdt_revision >= 2 { 8 } else { 4 })?;
+                let source2 = source2.to_integer(width)?;
                 let mut buffer = Vec::new();
                 if self.dsdt_revision >= 2 {
                     buffer.extend_from_slice(&source1.to_le_bytes());
@@ -2146,13 +2571,18 @@ where
                 Object::Buffer(buffer).wrap()
             }
             ObjectType::Buffer => {
-                let mut buffer = source1.as_buffer()?.to_vec();
-                buffer.extend(source2.to_buffer(if self.dsdt_revision >= 2 { 8 } else { 4 })?);
+                let first = source1.as_buffer()?;
+                let second = source2.to_buffer(width)?;
+                // Hardening: a loop of `Concat`s doubled a buffer without bound.
+                self.check_size(first.len().saturating_add(second.len()))?;
+                let mut buffer = first.to_vec();
+                buffer.extend(second);
                 Object::Buffer(buffer).wrap()
             }
             _ => {
                 let source1 = resolve_as_string(&source1);
                 let source2 = resolve_as_string(&source2);
+                self.check_size(source1.len().saturating_add(source2.len()))?;
                 Object::String(source1 + &source2).wrap()
             }
         };
@@ -2164,42 +2594,52 @@ where
     }
 
     fn do_from_bcd(&self, context: &mut MethodContext, op: OpInFlight) -> Result<(), AmlError> {
-        let [Argument::Object(value)] = &op.arguments[..] else { panic!() };
+        // Hardening: the target was never accepted (the pattern always failed with the target present) or stored to.
+        let [Argument::Object(value), target] = &op.arguments[..] else {
+            return Err(AmlError::MalformedStream);
+        };
         let mut value = value.clone().unwrap_transparent_reference().as_integer()?;
 
-        let mut result = 0;
-        let mut i = 1;
+        let mut result: u64 = 0;
+        let mut i: u64 = 1;
         while value > 0 {
-            result += (value & 0x0f) * i;
-            i *= 10;
+            result = result.wrapping_add((value & 0x0f).wrapping_mul(i));
+            i = i.wrapping_mul(10);
             value >>= 4;
         }
 
-        context.contribute_arg(Argument::Object(Object::Integer(result).wrap()));
+        let result = self.do_store(target, Object::Integer(result).wrap())?;
+        context.contribute_arg(Argument::Object(result));
         context.retire_op(op);
         Ok(())
     }
 
     fn do_to_bcd(&self, context: &mut MethodContext, op: OpInFlight) -> Result<(), AmlError> {
-        let [Argument::Object(value)] = &op.arguments[..] else { panic!() };
+        let [Argument::Object(value), target] = &op.arguments[..] else {
+            return Err(AmlError::MalformedStream);
+        };
         let mut value = value.clone().unwrap_transparent_reference().as_integer()?;
 
-        let mut result = 0;
-        let mut i = 0;
-        while value > 0 {
+        // Hardening: a shift of 64 or more (a value of 17 digits or more) was an overflow.
+        let mut result: u64 = 0;
+        let mut i: u32 = 0;
+        while value > 0 && i < 16 {
             result |= (value % 10) << (4 * i);
             value /= 10;
             i += 1;
         }
 
-        context.contribute_arg(Argument::Object(Object::Integer(result).wrap()));
+        let result = self.do_store(target, Object::Integer(result).wrap())?;
+        context.contribute_arg(Argument::Object(result));
         context.retire_op(op);
         Ok(())
     }
 
     fn do_size_of(&self, context: &mut MethodContext, op: OpInFlight) -> Result<(), AmlError> {
-        let [Argument::Object(object)] = &op.arguments[..] else { panic!() };
-        let object = object.clone().unwrap_transparent_reference();
+        let [Argument::Object(object)] = &op.arguments[..] else {
+            return Err(AmlError::MalformedStream);
+        };
+        let object = object.clone().unwrap_reference();
 
         let result = match *object {
             Object::Buffer(ref buffer) => buffer.len(),
@@ -2215,44 +2655,26 @@ where
 
     fn do_index(&self, context: &mut MethodContext, op: OpInFlight) -> Result<(), AmlError> {
         let [Argument::Object(object), Argument::Object(index_value), target] = &op.arguments[..] else {
-            panic!()
+            return Err(AmlError::MalformedStream);
         };
         let object = object.clone().unwrap_transparent_reference();
-        let index_value = index_value.clone().unwrap_transparent_reference().as_integer()?;
+        let index_value = usize::try_from(index_value.clone().unwrap_transparent_reference().as_integer()?)
+            .map_err(|_| AmlError::IndexOutOfBounds)?;
 
+        let byte_field = |len: usize| -> Result<Object, AmlError> {
+            if index_value >= len {
+                Err(AmlError::IndexOutOfBounds)?
+            }
+            Ok(Object::Reference {
+                kind: ReferenceKind::RefOf,
+                inner: Object::BufferField { buffer: object.clone(), offset: index_value * 8, length: 8 }.wrap(),
+            })
+        };
         let result = match *object {
-            Object::Buffer(ref buffer) => {
-                if index_value as usize >= buffer.len() {
-                    Err(AmlError::IndexOutOfBounds)?
-                }
-
-                Object::Reference {
-                    kind: ReferenceKind::RefOf,
-                    inner: Object::BufferField {
-                        buffer: object.clone(),
-                        offset: index_value as usize * 8,
-                        length: 8,
-                    }
-                    .wrap(),
-                }
-            }
-            Object::String(ref string) => {
-                if index_value as usize >= string.len() {
-                    Err(AmlError::IndexOutOfBounds)?
-                }
-
-                Object::Reference {
-                    kind: ReferenceKind::RefOf,
-                    inner: Object::BufferField {
-                        buffer: object.clone(),
-                        offset: index_value as usize * 8,
-                        length: 8,
-                    }
-                    .wrap(),
-                }
-            }
+            Object::Buffer(ref buffer) => byte_field(buffer.len())?,
+            Object::String(ref string) => byte_field(string.len())?,
             Object::Package(ref package) => {
-                let Some(element) = package.get(index_value as usize) else { Err(AmlError::IndexOutOfBounds)? };
+                let Some(element) = package.get(index_value) else { Err(AmlError::IndexOutOfBounds)? };
                 Object::Reference { kind: ReferenceKind::RefOf, inner: element.clone() }
             }
             _ => Err(AmlError::IndexOutOfBounds)?,
@@ -2265,87 +2687,120 @@ where
         Ok(())
     }
 
+    /// Hardening: rewritten without panics or `todo!`s, and without holding a mutable reference to the target while the
+    /// source (which may be the same object) is read: the source's value is taken first.
+    ///
+    /// - A named integer takes the source converted to an integer; a buffer field or field unit is written.
+    /// - A reference made by `Index` or `RefOf` (the usual way to fill a package's element in `_BST` or `_BIX`)
+    ///   stores into what it refers to, by the same rules.
+    /// - A local or an argument, and a named `Buffer`, `String`, `Package` or uninitialized object, take the
+    ///   source's value (the implicit conversions of ACPI 19.3.5 are not done; this is what NT is said to do).
+    /// - Anything else (a device, a method, a mutex...) is an error.
     fn do_store(&self, target: &Argument, object: WrappedObject) -> Result<WrappedObject, AmlError> {
         let object = object.unwrap_transparent_reference();
-        let token = self.object_token.lock();
-
-        /*
-         * TODO: stores should do more implicit conversion to the type of the destination in some
-         * cases, in line with section 19.3.5 of the spec. It's not clear what existing
-         * interpreters do - NT may just be memcpying objects over each other...
-         *
-         * TODO: stores to fields with `BufferAcc` can actually return a value of the store that
-         * differs from what was written into the field. This is used for complex field types with
-         * a write-then-read pattern. The return value is then used as the 'result' of the storing
-         * expression.
-         */
         let to_return = object.clone();
-
         match target {
-            Argument::Null => {}
-            Argument::Object(target) => match unsafe { target.gain_mut(&token) } {
-                Object::Integer(target) => match unsafe { object.gain_mut(&token) } {
-                    Object::Integer(value) => {
-                        *target = *value;
-                    }
-                    Object::BufferField { .. } => {
-                        let mut buffer = [0u8; 8];
-                        unsafe { object.gain_mut(&token) }.read_buffer_field(&mut buffer)?;
-                        let value = u64::from_le_bytes(buffer);
-                        *target = value;
-                    }
-                    Object::FieldUnit(field) => {
-                        // TODO: not sure if we should convert buffers to integers if needed here?
-                        *target = self.do_field_read(field)?.as_integer()?;
-                    }
-                    _ => {
-                        let as_integer = object.to_integer(if self.dsdt_revision >= 2 { 8 } else { 4 })?;
-                        *target = as_integer;
-                    }
-                },
-                Object::BufferField { .. } => match unsafe { object.gain_mut(&token) } {
-                    Object::Integer(value) => {
-                        unsafe { target.gain_mut(&token) }.write_buffer_field(&value.to_le_bytes(), &token)?;
-                    }
-                    Object::Buffer(value) => {
-                        unsafe { target.gain_mut(&token) }.write_buffer_field(value.as_slice(), &token)?;
-                    }
-                    _ => panic!(),
-                },
-                Object::FieldUnit(field) => self.do_field_write(field, object)?,
-                Object::Reference { kind, inner } => {
-                    match kind {
-                        ReferenceKind::RefOf => todo!(),
-                        ReferenceKind::LocalOrArg => {
-                            if let Object::Reference { kind: _inner_kind, inner: inner_inner } = &**inner {
-                                // TODO: this should store into the reference, potentially doing an
-                                // implicit cast
-                                unsafe {
-                                    *inner_inner.gain_mut(&token) = object.gain_mut(&token).clone();
-                                }
-                            } else {
-                                // Overwrite the value
-                                unsafe {
-                                    *inner.gain_mut(&token) = object.gain_mut(&token).clone();
-                                }
-                            }
-                        }
-                        ReferenceKind::Unresolved => todo!(),
-                    }
-                }
-                Object::Debug => {
-                    self.handler.handle_debug(&object);
-                }
-                _ => panic!("Stores to objects like {:?} are not yet supported", target),
-            },
-
-            Argument::Namestring(_) => todo!(),
-            Argument::ByteData(_) | Argument::DWordData(_) | Argument::TrackedPc(_) | Argument::PkgLength(_) => {
-                panic!()
+            Argument::Null => Ok(to_return),
+            Argument::Object(target) => {
+                self.store_into(target, &object, 0)?;
+                Ok(to_return)
             }
+            Argument::Namestring(_)
+            | Argument::ByteData(_)
+            | Argument::DWordData(_)
+            | Argument::TrackedPc(_)
+            | Argument::PkgLength(_) => Err(AmlError::MalformedStream),
+        }
+    }
+
+    /// The value a source object stores: a field unit or buffer field is read first.
+    fn store_value(&self, object: &WrappedObject) -> Result<Object, AmlError> {
+        match **object {
+            Object::FieldUnit(ref field) => Ok((*self.do_field_read(field)?).clone()),
+            Object::BufferField { ref length, .. } => {
+                // Hardening: checked before it is allocated (the allocation came first).
+                let bytes = length.div_ceil(8).max(8);
+                self.check_size(bytes)?;
+                let mut buffer = vec![0u8; bytes];
+                object.read_buffer_field(&mut buffer)?;
+                if *length <= 64 {
+                    let mut bytes = [0u8; 8];
+                    bytes.copy_from_slice(&buffer[..8]);
+                    Ok(Object::Integer(u64::from_le_bytes(bytes)))
+                } else {
+                    buffer.truncate(length.div_ceil(8));
+                    Ok(Object::Buffer(buffer))
+                }
+            }
+            ref other => Ok(other.clone()),
+        }
+    }
+
+    fn store_into(&self, target: &WrappedObject, object: &WrappedObject, depth: usize) -> Result<(), AmlError> {
+        // A chain of references is followed a few steps at most.
+        if depth > 8 {
+            return Err(AmlError::InvalidOperationOnObject { op: Operation::Store, typ: ObjectType::Reference });
+        }
+        let width = if self.dsdt_revision >= 2 { 8 } else { 4 };
+        match **target {
+            Object::FieldUnit(ref field) => {
+                let value = self.store_value(object)?.wrap();
+                return self.do_field_write(field, value);
+            }
+            Object::BufferField { .. } => {
+                let bytes = self.store_value(object)?.to_buffer(width)?;
+                let token = self.object_token.lock();
+                // SAFETY: the object token is held; `bytes` is an owned copy of the source, so nothing borrows the
+                // field, and the field's buffer is a different object from the field itself.
+                return unsafe { target.gain_mut(&token) }.write_buffer_field(&bytes, &token);
+            }
+            Object::Reference { kind, ref inner } => {
+                return match kind {
+                    ReferenceKind::RefOf => self.store_into(inner, object, depth + 1),
+                    ReferenceKind::LocalOrArg => {
+                        // A local or argument that holds a reference stores through it; otherwise the local's
+                        // value is replaced.
+                        if let Object::Reference { kind: ReferenceKind::RefOf, .. } = **inner {
+                            self.store_into(inner, object, depth + 1)
+                        } else {
+                            let value = self.store_value(object)?;
+                            let token = self.object_token.lock();
+                            // SAFETY: the object token is held, and `value` is owned (read out of the source
+                            // before), so no reference into the local's slot is alive while it is replaced.
+                            unsafe { *inner.gain_mut(&token) = value };
+                            Ok(())
+                        }
+                    }
+                    // Hardening: was `todo!()`.
+                    ReferenceKind::Unresolved => Err(AmlError::InvalidOperationOnObject {
+                        op: Operation::Store,
+                        typ: ObjectType::Reference,
+                    }),
+                };
+            }
+            Object::Debug => {
+                self.handler.handle_debug(object);
+                return Ok(());
+            }
+            _ => {}
         }
 
-        Ok(to_return)
+        let value = self.store_value(object)?;
+        let token = self.object_token.lock();
+        // SAFETY: the object token is held, and `value` is owned (read out of the source before the token was
+        // taken), so the only reference into `target` is this one, for the length of the match.
+        match unsafe { target.gain_mut(&token) } {
+            Object::Integer(target) => {
+                *target = value.to_integer(width)?;
+                Ok(())
+            }
+            slot @ (Object::Uninitialized | Object::Buffer(_) | Object::String(_) | Object::Package(_)) => {
+                *slot = value;
+                Ok(())
+            }
+            // Hardening: was `panic!("Stores to objects like {:?} are not yet supported")`.
+            other => Err(AmlError::InvalidOperationOnObject { op: Operation::Store, typ: other.typ() }),
+        }
     }
 
     /// Do a read from a field by performing one or more well-formed accesses to the underlying
@@ -2353,124 +2808,86 @@ where
     /// return either an `Integer` or `Buffer` as appropriate, guided by the size of the field
     /// and expected integer size (as per the DSDT revision).
     fn do_field_read(&self, field: &FieldUnit) -> Result<WrappedObject, AmlError> {
+        self.field_read(field, 0)
+    }
+
+    fn field_read(&self, field: &FieldUnit, depth: usize) -> Result<WrappedObject, AmlError> {
         let needs_buffer = if self.dsdt_revision >= 2 { field.bit_length > 64 } else { field.bit_length > 32 };
         let access_width_bits = field.flags.access_type_bytes()? * 8;
 
         trace!("AML field read. Field = {:?}", field);
 
-        // TODO: if the field needs to be locked, acquire/release a global mutex?
-
-        enum Output {
-            Integer([u8; 8]),
-            Buffer(Vec<u8>),
-        }
-        let mut output = if needs_buffer {
-            Output::Buffer(vec![0; field.bit_length.next_multiple_of(8)])
-        } else {
-            Output::Integer([0; 8])
-        };
-        let output_bytes = match &mut output {
-            Output::Buffer(bytes) => bytes.as_mut_slice(),
-            Output::Integer(value) => value,
-        };
-
-        let read_region = match field.kind {
-            FieldUnitKind::Normal { ref region } => region,
-            // FieldUnitKind::Bank { ref region, ref bank, bank_value } => {
-            FieldUnitKind::Bank { .. } => {
-                // TODO: put the bank_value in the bank
-                todo!();
-            }
-            // FieldUnitKind::Index { ref index, ref data } => {
-            FieldUnitKind::Index { .. } => {
-                // TODO: configure the correct index
-                todo!();
-            }
-        };
-        let Object::OpRegion(ref read_region) = **read_region else { panic!() };
-
-        /*
-         * TODO: it might be worth having a fast path here for reads that don't do weird
-         * unaligned accesses, which I'm guessing might be relatively common on real
-         * hardware? Eg. single native read + mask
-         */
+        // Hardening: the buffer is the field's length in bytes (it was its length in bits), checked first.
+        let byte_length = field.bit_length.div_ceil(8);
+        self.check_size(byte_length)?;
+        let mut output = vec![0u8; usize::max(byte_length, 8)];
 
         /*
          * Break the field read into native reads that respect the region's access width.
          * Copy each potentially-unaligned part into the destination's bit range.
          */
-        let native_accesses_needed = (field.bit_length + (field.bit_index % access_width_bits))
-            .next_multiple_of(access_width_bits)
-            / access_width_bits;
         let mut read_so_far = 0;
-        for i in 0..native_accesses_needed {
-            let aligned_offset = object::align_down(field.bit_index + i * access_width_bits, access_width_bits);
-            let raw = self.do_native_region_read(read_region, aligned_offset / 8, access_width_bits / 8)?;
+        let mut i = 0;
+        while read_so_far < field.bit_length {
+            let bit =
+                field.bit_index.checked_add(i * access_width_bits).ok_or(AmlError::RegionAccessOutOfBounds)?;
+            let aligned_offset = object::align_down(bit, access_width_bits);
+            let raw = self.field_access(field, aligned_offset / 8, access_width_bits / 8, None, depth)?;
             let src_index = if i == 0 { field.bit_index % access_width_bits } else { 0 };
-            let remaining_length = field.bit_length - read_so_far;
-            let length = if i == 0 {
-                usize::min(remaining_length, access_width_bits - (field.bit_index % access_width_bits))
-            } else {
-                usize::min(remaining_length, access_width_bits)
-            };
+            let length = usize::min(field.bit_length - read_so_far, access_width_bits - src_index);
 
-            object::copy_bits(&raw.to_le_bytes(), src_index, output_bytes, read_so_far, length);
+            object::copy_bits(&raw.to_le_bytes(), src_index, &mut output, read_so_far, length);
             read_so_far += length;
+            i += 1;
         }
 
-        match output {
-            Output::Buffer(bytes) => Ok(Object::Buffer(bytes).wrap()),
-            Output::Integer(value) => Ok(Object::Integer(u64::from_le_bytes(value)).wrap()),
+        if needs_buffer {
+            output.truncate(byte_length);
+            Ok(Object::Buffer(output).wrap())
+        } else {
+            let mut value = [0u8; 8];
+            value.copy_from_slice(&output[..8]);
+            Ok(Object::Integer(u64::from_le_bytes(value)).wrap())
         }
     }
 
     fn do_field_write(&self, field: &FieldUnit, value: WrappedObject) -> Result<(), AmlError> {
-        trace!("AML field write. Field = {:?}. Value = {}", field, value);
+        self.field_write(field, value, 0)
+    }
 
+    fn field_write(&self, field: &FieldUnit, value: WrappedObject, depth: usize) -> Result<(), AmlError> {
+        trace!("AML field write. Field = {:?}", field);
+
+        let integer_bytes;
         let value_bytes = match &*value {
-            Object::Integer(value) => &value.to_le_bytes() as &[u8],
+            Object::Integer(value) => {
+                integer_bytes = value.to_le_bytes();
+                &integer_bytes as &[u8]
+            }
             Object::Buffer(bytes) => bytes,
+            Object::String(string) => string.as_bytes(),
             _ => Err(AmlError::ObjectNotOfExpectedType { expected: ObjectType::Integer, got: value.typ() })?,
         };
         let access_width_bits = field.flags.access_type_bytes()? * 8;
 
-        let write_region = match field.kind {
-            FieldUnitKind::Normal { ref region } => region,
-            // FieldUnitKind::Bank { ref region, ref bank, bank_value } => {
-            FieldUnitKind::Bank { .. } => {
-                // TODO: put the bank_value in the bank
-                todo!();
-            }
-            // FieldUnitKind::Index { ref index, ref data } => {
-            FieldUnitKind::Index { .. } => {
-                // TODO: configure the correct index
-                todo!();
-            }
-        };
-        let Object::OpRegion(ref write_region) = **write_region else { panic!() };
-
-        // TODO: if the region wants locking, do that
-
-        // TODO: maybe also a fast path for writes
-
-        let native_accesses_needed = (field.bit_length + (field.bit_index % access_width_bits))
-            .next_multiple_of(access_width_bits)
-            / access_width_bits;
         let mut written_so_far = 0;
-
-        for i in 0..native_accesses_needed {
-            let aligned_offset = object::align_down(field.bit_index + i * access_width_bits, access_width_bits);
+        let mut i = 0;
+        while written_so_far < field.bit_length {
+            let bit =
+                field.bit_index.checked_add(i * access_width_bits).ok_or(AmlError::RegionAccessOutOfBounds)?;
+            let aligned_offset = object::align_down(bit, access_width_bits);
             let dst_index = if i == 0 { field.bit_index % access_width_bits } else { 0 };
+            let length = usize::min(field.bit_length - written_so_far, access_width_bits - dst_index);
 
             /*
              * If we're not going to write a whole native access, respect the field's
              * update rule. If we're meant to preserve the surrounding bits, we need to do
              * a read first.
              */
-            let mut bytes = if dst_index > 0 || (field.bit_length - written_so_far) < access_width_bits {
+            let mut bytes = if length < access_width_bits {
                 match field.flags.update_rule() {
                     FieldUpdateRule::Preserve => self
-                        .do_native_region_read(write_region, aligned_offset / 8, access_width_bits / 8)?
+                        .field_access(field, aligned_offset / 8, access_width_bits / 8, None, depth)?
                         .to_le_bytes(),
                     FieldUpdateRule::WriteAsOnes => [0xff; 8],
                     FieldUpdateRule::WriteAsZeros => [0; 8],
@@ -2479,78 +2896,126 @@ where
                 [0; 8]
             };
 
-            let remaining_length = field.bit_length - written_so_far;
-            let length = if i == 0 {
-                usize::min(remaining_length, access_width_bits - (field.bit_index % access_width_bits))
-            } else {
-                usize::min(remaining_length, access_width_bits)
-            };
-
             object::copy_bits(value_bytes, written_so_far, &mut bytes, dst_index, length);
-            self.do_native_region_write(
-                write_region,
+            self.field_access(
+                field,
                 aligned_offset / 8,
                 access_width_bits / 8,
-                u64::from_le_bytes(bytes),
+                Some(u64::from_le_bytes(bytes)),
+                depth,
             )?;
             written_so_far += length;
+            i += 1;
         }
 
         Ok(())
     }
 
+    /// Hardening: one access of a field's backing store: the region of a normal field; the region after the bank field
+    /// was set for a bank field; the data field after the index field was set to the byte offset for an index
+    /// field (both were `todo!()`). Reads when `write` is `None`. Index and bank fields nest at most a few deep.
+    fn field_access(
+        &self,
+        field: &FieldUnit,
+        offset: usize,
+        length: usize,
+        write: Option<u64>,
+        depth: usize,
+    ) -> Result<u64, AmlError> {
+        if depth > 4 {
+            return Err(AmlError::LimitExceeded(Limit::Reentrancy));
+        }
+        self.ops_used.fetch_add(1, Ordering::AcqRel);
+        if self.ops_used.load(Ordering::Acquire) > self.limits().max_ops {
+            return Err(AmlError::LimitExceeded(Limit::Ops));
+        }
+        let region = match field.kind {
+            FieldUnitKind::Normal { ref region } => region,
+            FieldUnitKind::Bank { ref region, ref bank, bank_value } => {
+                let Object::FieldUnit(ref bank) = **bank else {
+                    return Err(AmlError::ObjectNotOfExpectedType {
+                        expected: ObjectType::FieldUnit,
+                        got: bank.typ(),
+                    });
+                };
+                self.field_write(bank, Object::Integer(bank_value).wrap(), depth + 1)?;
+                region
+            }
+            FieldUnitKind::Index { ref index, ref data } => {
+                let (Object::FieldUnit(index), Object::FieldUnit(data)) = (&**index, &**data) else {
+                    return Err(AmlError::ObjectNotOfExpectedType {
+                        expected: ObjectType::FieldUnit,
+                        got: index.typ(),
+                    });
+                };
+                self.field_write(index, Object::Integer(offset as u64).wrap(), depth + 1)?;
+                return match write {
+                    Some(value) => self.field_write(data, Object::Integer(value).wrap(), depth + 1).map(|()| 0),
+                    None => self.field_read(data, depth + 1)?.as_integer(),
+                };
+            }
+        };
+        // Hardening: was `panic!()`.
+        let Object::OpRegion(ref region) = **region else {
+            return Err(AmlError::ObjectNotOfExpectedType { expected: ObjectType::OpRegion, got: region.typ() });
+        };
+        match write {
+            Some(value) => self.do_native_region_write(region, offset, length, value).map(|()| 0),
+            None => self.do_native_region_read(region, offset, length),
+        }
+    }
+
+    /// Hardening: checks an access against the region's length.
+    fn check_region_access(region: &OpRegion, offset: usize, length: usize) -> Result<(), AmlError> {
+        let end = (offset as u64).checked_add(length as u64).ok_or(AmlError::RegionAccessOutOfBounds)?;
+        if end > region.length { Err(AmlError::RegionAccessOutOfBounds) } else { Ok(()) }
+    }
+
     /// Performs an actual read from an operation region. `offset` and `length` must respect the
     /// access requirements of the field being read, and are supplied in **bytes**. This may call
     /// AML methods if required, and may invoke user-supplied handlers.
+    ///
+    /// Hardening: an installed handler for the region's space is used first (for every space); unsupported widths and
+    /// accesses past the region are errors, not panics.
     fn do_native_region_read(&self, region: &OpRegion, offset: usize, length: usize) -> Result<u64, AmlError> {
         trace!("Native field read. Region = {:?}, offset = {:#x}, length={:#x}", region, offset, length);
+        Self::check_region_access(region, offset, length)?;
+
+        if let Some(handler) = self.region_handler(region.space) {
+            return handler.read(region, offset as u64, (length * 8) as u8);
+        }
 
         match region.space {
-            RegionSpace::SystemMemory => Ok({
-                let address = region.base as usize + offset;
-                match length {
+            RegionSpace::SystemMemory => {
+                let address = self.memory_address(region, offset)?;
+                Ok(match length {
                     1 => self.handler.read_u8(address) as u64,
                     2 => self.handler.read_u16(address) as u64,
                     4 => self.handler.read_u32(address) as u64,
                     8 => self.handler.read_u64(address),
-                    _ => panic!(),
-                }
-            }),
-            RegionSpace::SystemIO => Ok({
-                let address = region.base as u16 + offset as u16;
-                match length {
-                    1 => self.handler.read_io_u8(address) as u64,
-                    2 => self.handler.read_io_u16(address) as u64,
-                    4 => self.handler.read_io_u32(address) as u64,
-                    _ => panic!(),
-                }
-            }),
+                    _ => return Err(AmlError::InvalidFieldFlags),
+                })
+            }
+            RegionSpace::SystemIO => {
+                let port = Self::io_port(region, offset)?;
+                Ok(match length {
+                    1 => self.handler.read_io_u8(port) as u64,
+                    2 => self.handler.read_io_u16(port) as u64,
+                    4 => self.handler.read_io_u32(port) as u64,
+                    _ => return Err(AmlError::InvalidFieldFlags),
+                })
+            }
             RegionSpace::PciConfig => {
                 let address = self.pci_address_for_device(&region.parent_device_path)?;
+                let offset = Self::pci_offset(region, offset, length)?;
                 match length {
-                    1 => Ok(self.handler.read_pci_u8(address, offset as u16) as u64),
-                    2 => Ok(self.handler.read_pci_u16(address, offset as u16) as u64),
-                    4 => Ok(self.handler.read_pci_u32(address, offset as u16) as u64),
-                    _ => panic!(),
+                    1 => Ok(self.handler.read_pci_u8(address, offset) as u64),
+                    2 => Ok(self.handler.read_pci_u16(address, offset) as u64),
+                    4 => Ok(self.handler.read_pci_u32(address, offset) as u64),
+                    _ => Err(AmlError::InvalidFieldFlags),
                 }
             }
-
-            RegionSpace::EmbeddedControl
-            | RegionSpace::SmBus
-            | RegionSpace::SystemCmos
-            | RegionSpace::PciBarTarget
-            | RegionSpace::Ipmi
-            | RegionSpace::GeneralPurposeIo
-            | RegionSpace::GenericSerialBus
-            | RegionSpace::Pcc
-            | RegionSpace::Oem(_) => {
-                if let Some(_handler) = self.region_handlers.lock().get(&region.space) {
-                    warn!("Custom region handlers aren't actually supported yet.");
-                    Err(AmlError::LibUnimplemented)
-                } else {
-                    Err(AmlError::NoHandlerForRegionAccess(region.space))
-                }
-            }
+            other => Err(AmlError::NoHandlerForRegionAccess(other)),
         }
     }
 
@@ -2568,56 +3033,73 @@ where
             "Native field write. Region = {:?}, offset = {:#x}, length={:#x}, value={:#x}",
             region, offset, length, value
         );
+        Self::check_region_access(region, offset, length)?;
+
+        if let Some(handler) = self.region_handler(region.space) {
+            return handler.write(region, offset as u64, (length * 8) as u8, value);
+        }
 
         match region.space {
             RegionSpace::SystemMemory => {
-                let address = region.base as usize + offset;
+                let address = self.memory_address(region, offset)?;
                 match length {
                     1 => self.handler.write_u8(address, value as u8),
                     2 => self.handler.write_u16(address, value as u16),
                     4 => self.handler.write_u32(address, value as u32),
                     8 => self.handler.write_u64(address, value),
-                    _ => panic!(),
+                    _ => return Err(AmlError::InvalidFieldFlags),
                 }
                 Ok(())
             }
             RegionSpace::SystemIO => {
-                let address = region.base as u16 + offset as u16;
+                let port = Self::io_port(region, offset)?;
                 match length {
-                    1 => self.handler.write_io_u8(address, value as u8),
-                    2 => self.handler.write_io_u16(address, value as u16),
-                    4 => self.handler.write_io_u32(address, value as u32),
-                    _ => panic!(),
+                    1 => self.handler.write_io_u8(port, value as u8),
+                    2 => self.handler.write_io_u16(port, value as u16),
+                    4 => self.handler.write_io_u32(port, value as u32),
+                    _ => return Err(AmlError::InvalidFieldFlags),
                 }
                 Ok(())
             }
             RegionSpace::PciConfig => {
                 let address = self.pci_address_for_device(&region.parent_device_path)?;
+                let offset = Self::pci_offset(region, offset, length)?;
                 match length {
-                    1 => self.handler.write_pci_u8(address, offset as u16, value as u8),
-                    2 => self.handler.write_pci_u16(address, offset as u16, value as u16),
-                    4 => self.handler.write_pci_u32(address, offset as u16, value as u32),
-                    _ => panic!(),
+                    1 => self.handler.write_pci_u8(address, offset, value as u8),
+                    2 => self.handler.write_pci_u16(address, offset, value as u16),
+                    4 => self.handler.write_pci_u32(address, offset, value as u32),
+                    _ => return Err(AmlError::InvalidFieldFlags),
                 }
                 Ok(())
             }
+            other => Err(AmlError::NoHandlerForRegionAccess(other)),
+        }
+    }
 
-            RegionSpace::EmbeddedControl
-            | RegionSpace::SmBus
-            | RegionSpace::SystemCmos
-            | RegionSpace::PciBarTarget
-            | RegionSpace::Ipmi
-            | RegionSpace::GeneralPurposeIo
-            | RegionSpace::GenericSerialBus
-            | RegionSpace::Pcc
-            | RegionSpace::Oem(_) => {
-                if let Some(_handler) = self.region_handlers.lock().get(&region.space) {
-                    warn!("Custom region handlers aren't actually supported yet.");
-                    Err(AmlError::LibUnimplemented)
-                } else {
-                    Err(AmlError::NoHandlerForRegionAccess(region.space))
-                }
-            }
+    /// Hardening: `base + offset` with no overflow.
+    fn memory_address(&self, region: &OpRegion, offset: usize) -> Result<usize, AmlError> {
+        region
+            .base
+            .checked_add(offset as u64)
+            .and_then(|address| usize::try_from(address).ok())
+            .ok_or(AmlError::RegionAccessOutOfBounds)
+    }
+
+    /// Hardening: a port above 0xffff is an error (it wrapped).
+    fn io_port(region: &OpRegion, offset: usize) -> Result<u16, AmlError> {
+        region
+            .base
+            .checked_add(offset as u64)
+            .and_then(|port| u16::try_from(port).ok())
+            .ok_or(AmlError::RegionAccessOutOfBounds)
+    }
+
+    /// Hardening: the configuration space is 4 KiB.
+    fn pci_offset(region: &OpRegion, offset: usize, length: usize) -> Result<u16, AmlError> {
+        let start = region.base.checked_add(offset as u64).ok_or(AmlError::RegionAccessOutOfBounds)?;
+        match start.checked_add(length as u64) {
+            Some(end) if end <= 4096 => Ok(start as u16),
+            _ => Err(AmlError::RegionAccessOutOfBounds),
         }
     }
 
@@ -2626,16 +3108,16 @@ where
          * TODO: it's not ideal to do these reads for every native access. See if we can
          * cache them somewhere?
          */
-        let seg = match self.evaluate_if_present(AmlName::from_str("_SEG").unwrap().resolve(path)?, vec![])? {
+        let seg = match self.evaluate_if_present(static_name("_SEG").resolve(path)?, vec![])? {
             Some(value) => value.as_integer()?,
             None => 0,
         };
-        let bus = match self.evaluate_if_present(AmlName::from_str("_BBR").unwrap().resolve(path)?, vec![])? {
+        let bus = match self.evaluate_if_present(static_name("_BBR").resolve(path)?, vec![])? {
             Some(value) => value.as_integer()?,
             None => 0,
         };
         let (device, function) = {
-            let adr = self.evaluate_if_present(AmlName::from_str("_ADR").unwrap().resolve(path)?, vec![])?;
+            let adr = self.evaluate_if_present(static_name("_ADR").resolve(path)?, vec![])?;
             let adr = match adr {
                 Some(adr) => adr.as_integer()?,
                 None => 0,
@@ -2643,6 +3125,14 @@ where
             (adr.get_bits(16..32), adr.get_bits(0..16))
         };
         Ok(PciAddress::new(seg as u16, bus as u8, device as u8, function as u8))
+    }
+}
+
+/// Hardening: a package's element count, against the limit.
+fn check_elements(limits: &Limits, count: u64) -> Result<usize, AmlError> {
+    match usize::try_from(count) {
+        Ok(count) if count <= limits.max_package_elements => Ok(count),
+        _ => Err(AmlError::LimitExceeded(Limit::PackageElements)),
     }
 }
 
@@ -2678,7 +3168,7 @@ impl Block {
     }
 }
 
-#[derive(PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug)]
 pub enum BlockKind {
     Table,
     Method {
@@ -2694,6 +3184,8 @@ pub enum BlockKind {
     IfThenBranch,
     While {
         start_pc: usize,
+        // Hardening: how many times the loop went round (bounded by `Limits::max_loop_iterations`).
+        iterations: u64,
     },
 }
 
@@ -2730,6 +3222,8 @@ struct OpInFlight {
     expected_arguments: usize,
     arguments: Vec<Argument>,
     resolve_behaviour: &'static [ResolveBehaviour],
+    // Hardening: the resolved path of the object a `Notify` names.
+    target_name: Option<AmlName>,
 }
 
 #[derive(Debug)]
@@ -2747,7 +3241,13 @@ impl OpInFlight {
     /// Creates a new `OpInFlight`. The number of expected arguments is inferred from the number of
     /// `ResolveBehaviour`s passed.
     pub fn new(op: Opcode, resolve_behaviour: &'static [ResolveBehaviour]) -> OpInFlight {
-        OpInFlight { op, expected_arguments: resolve_behaviour.len(), arguments: Vec::new(), resolve_behaviour }
+        OpInFlight {
+            op,
+            expected_arguments: resolve_behaviour.len(),
+            arguments: Vec::new(),
+            resolve_behaviour,
+            target_name: None,
+        }
     }
 
     /// Creates a new `OpInFlight` with the given number of expected arguments. This should be used
@@ -2758,7 +3258,7 @@ impl OpInFlight {
         expected_arguments: usize,
         resolve_behaviour: &'static [ResolveBehaviour],
     ) -> OpInFlight {
-        OpInFlight { op, expected_arguments, arguments: Vec::new(), resolve_behaviour }
+        OpInFlight { op, expected_arguments, arguments: Vec::new(), resolve_behaviour, target_name: None }
     }
 
     /// Creates a new `OpInFlight` with a number of arguments that have already been interpreted,
@@ -2769,7 +3269,13 @@ impl OpInFlight {
         more: usize,
         resolve_behaviour: &'static [ResolveBehaviour],
     ) -> OpInFlight {
-        OpInFlight { op, expected_arguments: arguments.len() + more, arguments, resolve_behaviour }
+        OpInFlight {
+            op,
+            expected_arguments: arguments.len() + more,
+            arguments,
+            resolve_behaviour,
+            target_name: None,
+        }
     }
 
     /// Creates a new `OpInFlight` with a number of arguments that have already been interpreted,
@@ -2781,17 +3287,24 @@ impl OpInFlight {
         arguments: Vec<Argument>,
         resolve_behaviour: &'static [ResolveBehaviour],
     ) -> OpInFlight {
-        OpInFlight { op, expected_arguments: resolve_behaviour.len(), arguments, resolve_behaviour }
+        OpInFlight {
+            op,
+            expected_arguments: resolve_behaviour.len(),
+            arguments,
+            resolve_behaviour,
+            target_name: None,
+        }
     }
 
     /// Get the desired `ResolveBehaviour` for the argument currently being interpreted
-    fn resolve_behaviour(&self) -> ResolveBehaviour {
+    /// Hardening: an op given more operands than it takes is malformed AML (this was a `panic!`).
+    fn resolve_behaviour(&self) -> Result<ResolveBehaviour, AmlError> {
         if let Some(behaviour) = self.resolve_behaviour.get(self.arguments.len()) {
-            *behaviour
-        } else if self.op == Opcode::Package || (self.op == Opcode::VarPackage && self.arguments.len() > 0) {
-            ResolveBehaviour::AsPackageElements
+            Ok(*behaviour)
+        } else if self.op == Opcode::Package || (self.op == Opcode::VarPackage && !self.arguments.is_empty()) {
+            Ok(ResolveBehaviour::AsPackageElements)
         } else {
-            panic!("Tried to get resolving behaviour for unexpected argument for operation of type {:?}", self.op);
+            Err(AmlError::MalformedStream)
         }
     }
 }
@@ -2863,7 +3376,7 @@ impl MethodContext {
             "START OP: {:?}, args: {:?}, with {} more needed ({:?})",
             op.op,
             op.arguments,
-            op.expected_arguments - op.arguments.len(),
+            op.expected_arguments.saturating_sub(op.arguments.len()),
             op.resolve_behaviour
         );
         self.in_flight.push(op);
@@ -2873,20 +3386,61 @@ impl MethodContext {
         trace!("RETIRE OP: {:?}, args: {:?}", op.op, op.arguments);
     }
 
-    fn start_new_block(&mut self, kind: BlockKind, length: usize) {
-        let block = Block {
-            stream: &self.current_block.stream()[..(self.current_block.pc + length)] as *const [u8],
-            pc: self.current_block.pc,
-            kind,
-        };
-        self.current_block.pc += length;
+    /// Hardening: a block past the end of the stream, or nested deeper than the limit, is an error (the slice panicked
+    /// and the nesting was unbounded).
+    fn start_new_block(&mut self, kind: BlockKind, length: usize, limits: &Limits) -> Result<(), AmlError> {
+        if self.block_stack.len() >= limits.max_block_nesting {
+            return Err(AmlError::LimitExceeded(Limit::BlockNesting));
+        }
+        let end = self.current_block.pc.checked_add(length).ok_or(AmlError::MalformedStream)?;
+        let stream = self.current_block.stream().get(..end).ok_or(AmlError::MalformedStream)? as *const [u8];
+        let block = Block { stream, pc: self.current_block.pc, kind };
+        self.current_block.pc = end;
         self.block_stack.push(mem::replace(&mut self.current_block, block));
+        Ok(())
+    }
+
+    /// Hardening: leaves the current block for the one around it (each caller used `pop().unwrap()`).
+    fn pop_block(&mut self) -> Result<(), AmlError> {
+        self.current_block = self.block_stack.pop().ok_or(AmlError::MalformedStream)?;
+        Ok(())
+    }
+
+    /// Hardening: what is left of a PkgLength that started at `start_pc` (the subtraction underflowed).
+    fn remaining(&self, start_pc: usize, pkg_length: usize) -> Result<usize, AmlError> {
+        let used = self.current_block.pc.checked_sub(start_pc).ok_or(AmlError::MalformedStream)?;
+        pkg_length.checked_sub(used).ok_or(AmlError::MalformedStream)
+    }
+
+    /// Hardening: the next `length` bytes of the stream, bounds-checked.
+    fn take(&mut self, length: usize) -> Result<&[u8], AmlError> {
+        let start = self.current_block.pc;
+        let end = start.checked_add(length).ok_or(AmlError::MalformedStream)?;
+        if end > self.current_block.stream().len() {
+            return Err(AmlError::MalformedStream);
+        }
+        self.current_block.pc = end;
+        Ok(&self.current_block.stream()[start..end])
+    }
+
+    /// Hardening: skips `length` bytes, bounds-checked.
+    fn skip(&mut self, length: usize) -> Result<(), AmlError> {
+        self.take(length).map(|_| ())
+    }
+
+    /// Hardening: the scope of the method this context runs, if it runs one.
+    fn method_scope(&self) -> Option<AmlName> {
+        self.block_stack.iter().chain(core::iter::once(&self.current_block)).find_map(|block| match block.kind {
+            BlockKind::Method { ref method_scope } => Some(method_scope.clone()),
+            _ => None,
+        })
     }
 
     fn opcode(&mut self) -> Result<Opcode, AmlError> {
         let opcode: u16 = match self.next()? {
             0x5b => {
-                let ext = self.next()?;
+                // Hardening: an extended-opcode prefix with nothing after it is malformed, not the end of the block.
+                let ext = self.next().map_err(|_| AmlError::MalformedStream)?;
                 (0x5b << 8) as u16 | ext as u16
             }
             other => other as u16,
@@ -3025,8 +3579,8 @@ impl MethodContext {
 
     fn pkglength(&mut self) -> Result<usize, AmlError> {
         let lead_byte = self.next()?;
+        // (Two bits: always below 4. The `assert!` that said so is gone.)
         let byte_count = lead_byte.get_bits(6..8);
-        assert!(byte_count < 4);
 
         if byte_count == 0 {
             Ok(lead_byte.get_bits(0..6) as usize)
@@ -3282,6 +3836,7 @@ pub enum Operation {
     ResetEvent,
     SignalEvent,
     WaitEvent,
+    Store,
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -3333,4 +3888,43 @@ pub enum AmlError {
     /// This is emitted to signal that the library does not support the requested behaviour. This
     /// should eventually never be emitted.
     LibUnimplemented,
+
+    // Hardening: the errors that replaced panics.
+    /// An opcode or feature this interpreter does not run (`Load`, `LoadTable`, `Match`).
+    Unsupported(&'static str),
+    /// The stream is malformed: a length past its end, an op given the wrong operands, a block that does not
+    /// close.
+    MalformedStream,
+    /// A [`Limits`] limit was reached.
+    LimitExceeded(Limit),
+    /// `Divide` or `Mod` by zero.
+    DivideByZero,
+    /// A handler for this region space is installed already.
+    RegionHandlerAlreadyInstalled(RegionSpace),
+    /// A field access past its operation region (or past the address space).
+    RegionAccessOutOfBounds,
+    /// A fixed ACPI register could not be accessed.
+    RegisterAccessFailed,
+    /// The AML ran `Fatal`: the host was told (`Handler::handle_fatal_error`) and the evaluation stops.
+    FatalOpcode {
+        typ: u8,
+        code: u32,
+        arg: u64,
+    },
+}
+
+/// Hardening: a buffer field of `length` bits at bit `offset` must lie inside its buffer (or string) as it is now, and have
+/// at least one bit. (A buffer replaced by a shorter one later is checked again when the field is read or written.)
+fn field_in_buffer(buffer: &WrappedObject, offset: usize, length: usize) -> Result<(), AmlError> {
+    let bytes = match **buffer {
+        Object::Buffer(ref b) => b.len(),
+        Object::String(ref s) => s.len(),
+        ref other => {
+            return Err(AmlError::InvalidOperationOnObject { op: Operation::ReadBufferField, typ: other.typ() });
+        }
+    };
+    match offset.checked_add(length) {
+        Some(end) if length > 0 && end <= bytes.saturating_mul(8) => Ok(()),
+        _ => Err(AmlError::IndexOutOfBounds),
+    }
 }

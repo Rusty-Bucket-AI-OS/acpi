@@ -92,12 +92,16 @@ impl PciRoutingTable {
                      *   |            |           | pin is connected.                                         |
                      *   | -----------|-----------|-----------------------------------------------------------|
                      */
-                    let Object::Integer(address) = *pin_package[0] else {
+                    // Hardening: a package with fewer than four elements was an out-of-bounds panic.
+                    let [address, pin, source, source_index, ..] = &pin_package[..] else {
+                        return Err(AmlError::PrtInvalidAddress);
+                    };
+                    let Object::Integer(address) = **address else {
                         return Err(AmlError::PrtInvalidAddress);
                     };
                     let device = address.get_bits(16..32).try_into().map_err(|_| AmlError::PrtInvalidAddress)?;
                     let function = address.get_bits(0..16).try_into().map_err(|_| AmlError::PrtInvalidAddress)?;
-                    let pin = match *pin_package[1] {
+                    let pin = match **pin {
                         Object::Integer(0) => Pin::IntA,
                         Object::Integer(1) => Pin::IntB,
                         Object::Integer(2) => Pin::IntC,
@@ -105,13 +109,13 @@ impl PciRoutingTable {
                         _ => return Err(AmlError::PrtInvalidPin),
                     };
 
-                    match *pin_package[2] {
+                    match **source {
                         Object::Integer(0) => {
                             /*
                              * The Source Index field contains the GSI number that this interrupt is attached
                              * to.
                              */
-                            let Object::Integer(gsi) = *pin_package[3] else {
+                            let Object::Integer(gsi) = **source_index else {
                                 return Err(AmlError::PrtInvalidGsi);
                             };
                             entries.push(PciRoute {
@@ -175,7 +179,8 @@ impl PciRoutingTable {
                 irq: gsi,
             }),
             PciRouteType::LinkObject(ref name) => {
-                let path = AmlName::from_str("_CRS").unwrap().resolve(name)?;
+                // Hardening: was `.unwrap()` on a constant name.
+                let path = AmlName::from_str("_CRS")?.resolve(name)?;
                 let link_crs = interpreter.evaluate(path, vec![])?;
 
                 let resources = resource::resource_descriptor_list(link_crs)?;

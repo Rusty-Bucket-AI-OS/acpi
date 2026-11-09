@@ -203,7 +203,9 @@ impl<A: Allocator + Clone> InterruptModel<A> {
                         line: match entry.nmi_line {
                             0 => LocalInterruptLine::Lint0,
                             1 => LocalInterruptLine::Lint1,
-                            _ => return Err(AcpiError::InvalidMadt(MadtError::InvalidLocalNmiLine)),
+                            _ => {
+                                return Err(AcpiError::InvalidMadt(MadtError::InvalidLocalNmiLine));
+                            }
                         },
                     });
                 }
@@ -218,7 +220,9 @@ impl<A: Allocator + Clone> InterruptModel<A> {
                         line: match entry.nmi_line {
                             0 => LocalInterruptLine::Lint0,
                             1 => LocalInterruptLine::Lint1,
-                            _ => return Err(AcpiError::InvalidMadt(MadtError::InvalidLocalNmiLine)),
+                            _ => {
+                                return Err(AcpiError::InvalidMadt(MadtError::InvalidLocalNmiLine));
+                            }
                         },
                     });
                 }

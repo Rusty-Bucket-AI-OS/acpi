@@ -1,6 +1,6 @@
 use super::object::WrappedObject;
 use crate::aml::{AmlError, Operation, object::Object};
-use alloc::vec::Vec;
+use alloc::{string::String, vec::Vec};
 use bit_field::BitField;
 use byteorder::{ByteOrder, LittleEndian};
 use core::mem;
@@ -12,6 +12,15 @@ pub enum Resource {
     MemoryRange(MemoryRangeDescriptor),
     IOPort(IOPortDescriptor),
     Dma(DMADescriptor),
+    // Hardening: the descriptors a laptop's `_CRS` needs for HID over I2C: its interrupt line and its bus address.
+    Gpio(GpioDescriptor),
+    SerialBus(SerialBusDescriptor),
+    /// Hardening: a well-formed descriptor this crate does not decode (it was `unimplemented!()`): skipped, so the rest
+    /// of the list is still read.
+    Unsupported {
+        large: bool,
+        descriptor_type: u8,
+    },
 }
 
 /// Parse a `ResourceDescriptor` buffer into a list of resources.
@@ -37,63 +46,39 @@ pub fn resource_descriptor_list(descriptor: WrappedObject) -> Result<Vec<Resourc
     }
 }
 
+/// Hardening: every length is checked against the buffer (the header and `split_at` panicked on a short one).
 fn resource_descriptor(bytes: &[u8]) -> Result<(Option<Resource>, &[u8]), AmlError> {
+    let Some(&first) = bytes.first() else {
+        return Err(AmlError::InvalidResourceDescriptor);
+    };
     /*
      * If bit 7 of Byte 0 is set, it's a large descriptor. If not, it's a small descriptor.
      */
-    if bytes[0].get_bit(7) {
+    if first.get_bit(7) {
         /*
-         * We're parsing a large item. The descriptor type is encoded in Bits 0-6 of Byte 0. Valid types:
-         *      0x00: Reserved
-         *      0x01: 24-bit Memory Range Descriptor
-         *      0x02: Generic Register Descriptor
-         *      0x03: Reserved
-         *      0x04: Vendor-defined Descriptor
-         *      0x05: 32-bit Memory Range Descriptor
-         *      0x06: 32-bit Fixed Memory Range Descriptor
-         *      0x07: Address Space Resource Descriptor
-         *      0x08: Word Address Space Descriptor
-         *      0x09: Extended Interrupt Descriptor
-         *      0x0a: QWord Address Space Descriptor
-         *      0x0b: Extended Address Space Descriptor
-         *      0x0c: GPIO Connection Descriptor
-         *      0x0d: Pin Function Descriptor
-         *      0x0e: GenericSerialBus Connection Descriptor
-         *      0x0f: Pin Configuration Descriptor
-         *      0x10: Pin Group Descriptor
-         *      0x11: Pin Group Function Descriptor
-         *      0x12: Pin Group Configuration Descriptor
-         *      0x13-0x7f: Reserved
-         *
-         * Byte 1 contains bits 0-7 of the length, and Byte 2 contains bits 8-15 of the length. Subsequent
-         * bytes contain the actual data items.
+         * We're parsing a large item. The descriptor type is encoded in Bits 0-6 of Byte 0. Byte 1 contains bits 0-7
+         * of the length, and Byte 2 contains bits 8-15 of the length. Subsequent bytes contain the actual data items.
          */
-        let descriptor_type = bytes[0].get_bits(0..7);
-        let length = LittleEndian::read_u16(&bytes[1..=2]) as usize;
+        let descriptor_type = first.get_bits(0..7);
+        let length = match bytes.get(1..3) {
+            Some(length) => LittleEndian::read_u16(length) as usize,
+            None => return Err(AmlError::InvalidResourceDescriptor),
+        };
+        if bytes.len() < length + 3 {
+            return Err(AmlError::InvalidResourceDescriptor);
+        }
         let (descriptor_bytes, remaining_bytes) = bytes.split_at(length + 3);
 
         let descriptor = match descriptor_type {
-            0x01 => unimplemented!("24-bit Memory Range Descriptor"),
-            0x02 => unimplemented!("Generic Register Descriptor"),
-            0x03 => unimplemented!("0x03 Reserved"),
-            0x04 => unimplemented!("Vendor-defined Descriptor"),
-            0x05 => unimplemented!("32-bit Memory Range Descriptor"),
             0x06 => fixed_memory_descriptor(descriptor_bytes),
             0x07 => address_space_descriptor::<u32>(descriptor_bytes),
             0x08 => address_space_descriptor::<u16>(descriptor_bytes),
             0x09 => extended_interrupt_descriptor(descriptor_bytes),
             0x0a => address_space_descriptor::<u64>(descriptor_bytes),
-            0x0b => unimplemented!("Extended Address Space Descriptor"),
-            0x0c => unimplemented!("GPIO Connection Descriptor"),
-            0x0d => unimplemented!("Pin Function Descriptor"),
-            0x0e => unimplemented!("GenericSerialBus Connection Descriptor"),
-            0x0f => unimplemented!("Pin Configuration Descriptor"),
-            0x10 => unimplemented!("Pin Group Descriptor"),
-            0x11 => unimplemented!("Pin Group Function Descriptor"),
-            0x12 => unimplemented!("Pin Group Configuration Descriptor"),
-
-            0x00 | 0x13..=0x7f => Err(AmlError::InvalidResourceDescriptor),
-            0x80..=0xff => unreachable!(),
+            0x0c => gpio_connection_descriptor(descriptor_bytes),
+            0x0e => serial_bus_descriptor(descriptor_bytes),
+            0x01..=0x05 | 0x0b | 0x0d | 0x0f..=0x12 => Ok(Resource::Unsupported { large: true, descriptor_type }),
+            _ => Err(AmlError::InvalidResourceDescriptor),
         }?;
 
         Ok((Some(descriptor), remaining_bytes))
@@ -105,41 +90,145 @@ fn resource_descriptor(bytes: &[u8]) -> Result<(Option<Resource>, &[u8]), AmlErr
          *    | 0-2         | Length - n bytes  |
          *    | 3-6         | Small item type   |
          *    | 7           | 0 = small item    |
-         *
-         * The valid types are:
-         *      0x00-0x03: Reserved
-         *      0x04: IRQ Format Descriptor
-         *      0x05: DMA Format Descriptor
-         *      0x06: Start Dependent Functions Descriptor
-         *      0x07: End Dependent Functions Descriptor
-         *      0x08: IO Port Descriptor
-         *      0x09: Fixed Location IO Port Descriptor
-         *      0x0A: Fixed DMA Descriptor
-         *      0x0B-0x0D: Reserved
-         *      0x0E: Vendor Defined Descriptor
-         *      0x0F: End Tag Descriptor
          */
-        let descriptor_type = bytes[0].get_bits(3..=6);
-        let length: usize = bytes[0].get_bits(0..=2) as usize;
+        let descriptor_type = first.get_bits(3..=6);
+        let length: usize = first.get_bits(0..=2) as usize;
+        if bytes.len() < length + 1 {
+            return Err(AmlError::InvalidResourceDescriptor);
+        }
         let (descriptor_bytes, remaining_bytes) = bytes.split_at(length + 1);
 
         let descriptor = match descriptor_type {
-            0x00..=0x03 => Err(AmlError::InvalidResourceDescriptor),
             0x04 => irq_format_descriptor(descriptor_bytes),
             0x05 => dma_format_descriptor(descriptor_bytes),
-            0x06 => unimplemented!("Start Dependent Functions Descriptor"),
-            0x07 => unimplemented!("End Dependent Functions Descriptor"),
             0x08 => io_port_descriptor(descriptor_bytes),
-            0x09 => unimplemented!("Fixed Location IO Port Descriptor"),
-            0x0A => unimplemented!("Fixed DMA Descriptor"),
-            0x0B..=0x0D => Err(AmlError::InvalidResourceDescriptor),
-            0x0E => unimplemented!("Vendor Defined Descriptor"),
+            0x06 | 0x07 | 0x09 | 0x0A | 0x0E => Ok(Resource::Unsupported { large: false, descriptor_type }),
             0x0F => return Ok((None, &[])),
-            0x10..=0xFF => unreachable!(),
+            _ => Err(AmlError::InvalidResourceDescriptor),
         }?;
 
         Ok((Some(descriptor), remaining_bytes))
     }
+}
+
+/// Hardening: a GPIO Connection Descriptor (ACPI 6.5, 6.4.3.8.1): an interrupt (`GpioInt`) or I/O (`GpioIo`) line.
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct GpioDescriptor {
+    /// True for `GpioInt`, false for `GpioIo`.
+    pub is_interrupt: bool,
+    pub is_consumer: bool,
+    /// For `GpioInt`.
+    pub trigger: InterruptTrigger,
+    /// For `GpioInt`; `ActiveBoth` reads as `ActiveHigh` with `active_both` set.
+    pub polarity: InterruptPolarity,
+    pub active_both: bool,
+    pub is_shared: bool,
+    pub is_wake_capable: bool,
+    /// 0 default, 1 pull-up, 2 pull-down, 3 no pull, 0x80 and above vendor-defined.
+    pub pin_config: u8,
+    /// Hundredths of a millisecond.
+    pub debounce_timeout: u16,
+    /// The pins, as the GPIO controller numbers them.
+    pub pins: Vec<u16>,
+    /// The GPIO controller's path, e.g. `\_SB.GPO0`.
+    pub resource_source: String,
+}
+
+fn u16_at(bytes: &[u8], at: usize) -> Result<u16, AmlError> {
+    bytes.get(at..at + 2).map(LittleEndian::read_u16).ok_or(AmlError::InvalidResourceDescriptor)
+}
+
+/// A NUL-terminated string from `start` (to the end of the descriptor if there is no NUL).
+fn string_at(bytes: &[u8], start: usize) -> Result<String, AmlError> {
+    let tail = bytes.get(start..).ok_or(AmlError::InvalidResourceDescriptor)?;
+    let end = tail.iter().position(|b| *b == 0).unwrap_or(tail.len());
+    Ok(String::from_utf8_lossy(&tail[..end]).into_owned())
+}
+
+fn gpio_connection_descriptor(bytes: &[u8]) -> Result<Resource, AmlError> {
+    /*
+     * Byte 3 revision, 4 connection type (0 interrupt, 1 I/O), 5-6 general flags (bit 0 consumer), 7-8 interrupt
+     * and I/O flags (interrupt: bit 0 edge, bits 2:1 polarity, bit 3 shared, bit 4 wake), 9 pin configuration,
+     * 10-11 output drive strength, 12-13 debounce timeout, 14-15 pin table offset, 16 resource source index,
+     * 17-18 resource source name offset, 19-20 vendor data offset, 21-22 vendor data length. Offsets count from
+     * byte 0.
+     */
+    if bytes.len() < 23 {
+        return Err(AmlError::InvalidResourceDescriptor);
+    }
+    let is_interrupt = bytes[4] == 0;
+    let general = u16_at(bytes, 5)?;
+    let flags = u16_at(bytes, 7)?;
+    let pin_table = u16_at(bytes, 14)? as usize;
+    let source_name = u16_at(bytes, 17)? as usize;
+    if pin_table > source_name || source_name > bytes.len() {
+        return Err(AmlError::InvalidResourceDescriptor);
+    }
+    let (pins, _) = bytes[pin_table..source_name].as_chunks::<2>();
+    let pins = pins.iter().map(|pin| u16::from_le_bytes(*pin)).collect();
+    let polarity_bits = flags.get_bits(1..3);
+    Ok(Resource::Gpio(GpioDescriptor {
+        is_interrupt,
+        is_consumer: general.get_bit(0),
+        trigger: if flags.get_bit(0) { InterruptTrigger::Edge } else { InterruptTrigger::Level },
+        polarity: if polarity_bits == 1 { InterruptPolarity::ActiveLow } else { InterruptPolarity::ActiveHigh },
+        active_both: polarity_bits == 2,
+        is_shared: flags.get_bit(3),
+        is_wake_capable: flags.get_bit(4),
+        pin_config: bytes[9],
+        debounce_timeout: u16_at(bytes, 12)?,
+        pins,
+        resource_source: string_at(bytes, source_name)?,
+    }))
+}
+
+/// Hardening: a GenericSerialBus Connection Descriptor (ACPI 6.5, 6.4.3.8.2). I2C is decoded; SPI and UART keep their
+/// type and source only.
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct SerialBusDescriptor {
+    /// 1 I2C, 2 SPI, 3 UART, 4 CSI-2.
+    pub bus_type: u8,
+    pub is_consumer: bool,
+    /// For I2C: the bus speed in hertz.
+    pub connection_speed: u32,
+    /// For I2C: the device's address.
+    pub slave_address: u16,
+    /// For I2C: the address is 10 bits.
+    pub ten_bit_address: bool,
+    /// The bus controller's path, e.g. `\_SB.PCI0.I2C1`.
+    pub resource_source: String,
+}
+
+fn serial_bus_descriptor(bytes: &[u8]) -> Result<Resource, AmlError> {
+    /*
+     * Byte 3 revision, 4 resource source index, 5 bus type, 6 general flags (bit 1 consumer), 7-8 type-specific
+     * flags, 9 type-specific revision, 10-11 type data length (from byte 12), then the type data, then the
+     * resource source string. For I2C the type data is the connection speed (12-15) and the address (16-17), and
+     * flag bit 0 is 10-bit addressing.
+     */
+    if bytes.len() < 12 {
+        return Err(AmlError::InvalidResourceDescriptor);
+    }
+    let bus_type = bytes[5];
+    let type_flags = u16_at(bytes, 7)?;
+    let type_length = u16_at(bytes, 10)? as usize;
+    let source = 12 + type_length;
+    if source > bytes.len() {
+        return Err(AmlError::InvalidResourceDescriptor);
+    }
+    let (connection_speed, slave_address) = if bus_type == 1 && type_length >= 6 {
+        (LittleEndian::read_u32(&bytes[12..16]), u16_at(bytes, 16)?)
+    } else {
+        (0, 0)
+    };
+    Ok(Resource::SerialBus(SerialBusDescriptor {
+        bus_type,
+        is_consumer: bytes[6].get_bit(1),
+        connection_speed,
+        slave_address,
+        ten_bit_address: bus_type == 1 && type_flags.get_bit(0),
+        resource_source: string_at(bytes, source)?,
+    }))
 }
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
@@ -273,7 +362,10 @@ fn address_space_descriptor<T>(bytes: &[u8]) -> Result<Resource, AmlError> {
         1 => AddressSpaceResourceType::IORange,
         2 => AddressSpaceResourceType::BusNumberRange,
         3..=191 => return Err(AmlError::InvalidResourceDescriptor),
-        192..=255 => unimplemented!(),
+        // Hardening: vendor-defined types were `unimplemented!()`.
+        192..=255 => {
+            return Ok(Resource::Unsupported { large: true, descriptor_type: bytes[0].get_bits(0..7) });
+        }
     };
 
     let general_flags = bytes[4];
@@ -285,14 +377,13 @@ fn address_space_descriptor<T>(bytes: &[u8]) -> Result<Resource, AmlError> {
         AddressSpaceDecodeType::Additive
     };
 
-    let mut address_fields = bytes[6..].chunks_exact(size);
-
-    // it's safe to unwrap because we check the length at the top
-    let granularity = LittleEndian::read_uint(address_fields.next().unwrap(), size);
-    let address_range_min = LittleEndian::read_uint(address_fields.next().unwrap(), size);
-    let address_range_max = LittleEndian::read_uint(address_fields.next().unwrap(), size);
-    let translation_offset = LittleEndian::read_uint(address_fields.next().unwrap(), size);
-    let length = LittleEndian::read_uint(address_fields.next().unwrap(), size);
+    // Hardening: the length was checked at the top; the reads are indexed, with no `unwrap`s.
+    let field = |n: usize| LittleEndian::read_uint(&bytes[6 + n * size..6 + (n + 1) * size], size);
+    let granularity = field(0);
+    let address_range_min = field(1);
+    let address_range_max = field(2);
+    let translation_offset = field(3);
+    let length = field(4);
 
     Ok(Resource::AddressSpace(AddressSpaceDescriptor {
         resource_type,
@@ -456,16 +547,15 @@ pub fn dma_format_descriptor(bytes: &[u8]) -> Result<Resource, AmlError> {
         0 => DMASupportedSpeed::CompatibilityMode,
         1 => DMASupportedSpeed::TypeA,
         2 => DMASupportedSpeed::TypeB,
-        3 => DMASupportedSpeed::TypeF,
-        _ => unreachable!(),
+        _ => DMASupportedSpeed::TypeF,
     };
     let is_bus_master = options.get_bit(2);
     let transfer_type_preference = match options.get_bits(0..=1) {
         0 => DMATransferTypePreference::_8BitOnly,
         1 => DMATransferTypePreference::_8And16Bit,
         2 => DMATransferTypePreference::_16Bit,
-        3 => unimplemented!("Reserved DMA transfer type preference"),
-        _ => unreachable!(),
+        // Hardening: the reserved value was `unimplemented!()`.
+        _ => return Err(AmlError::InvalidResourceDescriptor),
     };
 
     Ok(Resource::Dma(DMADescriptor { channel_mask, supported_speeds, is_bus_master, transfer_type_preference }))
@@ -534,8 +624,11 @@ fn extended_interrupt_descriptor(bytes: &[u8]) -> Result<Resource, AmlError> {
         return Err(AmlError::InvalidResourceDescriptor);
     }
 
+    // Hardening: was `assert_eq!(.., 1)`: a list (as `_PRS` gives) is read as its first interrupt; none is an error.
     let number_of_interrupts = bytes[4] as usize;
-    assert_eq!(number_of_interrupts, 1);
+    if number_of_interrupts == 0 {
+        return Err(AmlError::InvalidResourceDescriptor);
+    }
     let irq = LittleEndian::read_u32(&[bytes[5], bytes[6], bytes[7], bytes[8]]);
 
     Ok(Resource::Irq(IrqDescriptor {
@@ -551,7 +644,6 @@ fn extended_interrupt_descriptor(bytes: &[u8]) -> Result<Resource, AmlError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::sync::Arc;
 
     #[test]
     fn test_parses_keyboard_crs() {

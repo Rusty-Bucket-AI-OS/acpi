@@ -39,8 +39,22 @@ impl Object {
     }
 }
 
+/// Hardening: how deep `Display` follows packages and references (a package can hold itself through `Index`).
+const DISPLAY_DEPTH: usize = 8;
+/// Hardening: how many references `unwrap_reference` follows before it stops (a reference cycle looped forever).
+const MAX_REFERENCE_CHAIN: usize = 64;
+
 impl fmt::Display for Object {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.fmt_depth(f, 0)
+    }
+}
+
+impl Object {
+    fn fmt_depth(&self, f: &mut fmt::Formatter<'_>, depth: usize) -> fmt::Result {
+        if depth > DISPLAY_DEPTH {
+            return write!(f, "...");
+        }
         match self {
             Object::Uninitialized => write!(f, "[Uninitialized]"),
             Object::Buffer(bytes) => write!(f, "Buffer({bytes:x?})"),
@@ -56,16 +70,19 @@ impl fmt::Display for Object {
             Object::Method { .. } => write!(f, "Method"),
             Object::NativeMethod { .. } => write!(f, "NativeMethod"),
             Object::Mutex { .. } => write!(f, "Mutex"),
-            Object::Reference { kind, inner } => write!(f, "Reference({:?} -> {})", kind, **inner),
+            Object::Reference { kind, inner } => {
+                write!(f, "Reference({:?} -> ", kind)?;
+                inner.fmt_depth(f, depth + 1)?;
+                write!(f, ")")
+            }
             Object::OpRegion(region) => write!(f, "{region:?}"),
             Object::Package(elements) => {
                 write!(f, "Package {{ ")?;
                 for (i, element) in elements.iter().enumerate() {
-                    if i == elements.len() - 1 {
-                        write!(f, "{}", **element)?;
-                    } else {
-                        write!(f, "{}, ", **element)?;
+                    if i > 0 {
+                        write!(f, ", ")?;
                     }
+                    element.fmt_depth(f, depth + 1)?;
                 }
                 write!(f, " }}")?;
                 Ok(())
@@ -124,20 +141,21 @@ impl WrappedObject {
 
     pub fn unwrap_reference(self) -> WrappedObject {
         let mut object = self;
-        loop {
+        for _ in 0..MAX_REFERENCE_CHAIN {
             if let Object::Reference { ref inner, .. } = *object {
                 object = inner.clone();
             } else {
-                return object.clone();
+                break;
             }
         }
+        object
     }
 
     /// Unwraps 'transparent' references (e.g. locals, arguments, and internal usage of reference-type objects), but maintain 'real'
     /// references deliberately created by AML.
     pub fn unwrap_transparent_reference(self) -> WrappedObject {
         let mut object = self;
-        loop {
+        for _ in 0..MAX_REFERENCE_CHAIN {
             // TODO: what should this do with unresolved namestrings? It would need namespace
             // access to resolve them (and then this would probs have to move to a method on
             // `Interpreter`)?
@@ -146,9 +164,10 @@ impl WrappedObject {
             {
                 object = inner.clone();
             } else {
-                return object.clone();
+                break;
             }
         }
+        object
     }
 }
 
@@ -219,10 +238,10 @@ impl Object {
     pub fn to_buffer(&self, allowed_bytes: usize) -> Result<Vec<u8>, AmlError> {
         match self {
             Object::Buffer(bytes) => Ok(bytes.clone()),
+            // Hardening: any width other than 4 is 8 (it was a `panic!`).
             Object::Integer(value) => match allowed_bytes {
                 4 => Ok((*value as u32).to_le_bytes().to_vec()),
-                8 => Ok(value.to_le_bytes().to_vec()),
-                _ => panic!(),
+                _ => Ok(value.to_le_bytes().to_vec()),
             },
             Object::String(value) => Ok(value.as_bytes().to_vec()),
             _ => Err(AmlError::InvalidOperationOnObject { op: Operation::ConvertToBuffer, typ: self.typ() }),
@@ -234,9 +253,19 @@ impl Object {
             let buffer = match **buffer {
                 Object::Buffer(ref buffer) => buffer.as_slice(),
                 Object::String(ref string) => string.as_bytes(),
-                _ => panic!(),
+                // Hardening: was `panic!()`.
+                _ => {
+                    return Err(AmlError::InvalidOperationOnObject {
+                        op: Operation::ReadBufferField,
+                        typ: buffer.typ(),
+                    });
+                }
             };
-            // TODO: bounds check the buffer first to avoid panicking
+            // Hardening: the field must lie in the buffer, and fit the destination.
+            check_field(buffer.len(), *offset, *length)?;
+            if length.div_ceil(8) > dst.len() {
+                return Err(AmlError::IndexOutOfBounds);
+            }
             copy_bits(buffer, *offset, dst, 0, *length);
             Ok(())
         } else {
@@ -245,16 +274,32 @@ impl Object {
     }
 
     pub fn write_buffer_field(&mut self, value: &[u8], token: &ObjectToken) -> Result<(), AmlError> {
-        // TODO: bounds check the buffer first to avoid panicking
         if let Self::BufferField { buffer, offset, length } = self {
-            let buffer = match unsafe { buffer.gain_mut(token) } {
-                Object::Buffer(buffer) => buffer.as_mut_slice(),
-                // XXX: this unfortunately requires us to trust AML to keep the string as valid
-                // UTF8... maybe there is a better way?
-                Object::String(string) => unsafe { string.as_bytes_mut() },
-                _ => panic!(),
-            };
-            copy_bits(value, 0, buffer, *offset, *length);
+            let typ = buffer.typ();
+            let (offset, length) = (*offset, *length);
+            // SAFETY: the caller holds the object token; the field's buffer is a different object from the field,
+            // and `value` is the caller's own copy, so no other reference into the buffer is alive.
+            match unsafe { buffer.gain_mut(token) } {
+                Object::Buffer(buffer) => {
+                    // Hardening: bounds checked first (a field past the buffer panicked).
+                    check_field(buffer.len(), offset, length)?;
+                    copy_bits(value, 0, buffer.as_mut_slice(), offset, length);
+                }
+                Object::String(string) => {
+                    // Hardening: written into a copy of the bytes, which become the string again only if still UTF-8
+                    // (writing a `str`'s bytes in place could leave it invalid).
+                    let mut bytes = string.as_bytes().to_vec();
+                    check_field(bytes.len(), offset, length)?;
+                    copy_bits(value, 0, &mut bytes, offset, length);
+                    *string = String::from_utf8(bytes).map_err(|_| AmlError::InvalidOperationOnObject {
+                        op: Operation::WriteBufferField,
+                        typ,
+                    })?;
+                }
+                _ => {
+                    return Err(AmlError::InvalidOperationOnObject { op: Operation::WriteBufferField, typ });
+                }
+            }
             Ok(())
         } else {
             Err(AmlError::InvalidOperationOnObject { op: Operation::WriteBufferField, typ: self.typ() })
@@ -358,8 +403,9 @@ impl FieldFlags {
         match self.0.get_bits(5..7) {
             0 => FieldUpdateRule::Preserve,
             1 => FieldUpdateRule::WriteAsOnes,
+            // Hardening: the reserved value 3 was `unreachable!()`; it preserves.
             2 => FieldUpdateRule::WriteAsZeros,
-            _ => unreachable!(),
+            _ => FieldUpdateRule::Preserve,
         }
     }
 }
@@ -460,13 +506,17 @@ pub(crate) fn copy_bits(
 
         let dst_shift = dst_index & 7;
         let mut dst_mask: u16 = if length < 8 { ((1 << length) - 1) as u16 } else { 0xff_u16 } << dst_shift;
-        dst[dst_index / 8] =
-            (dst[dst_index / 8] & !(dst_mask as u8)) | ((src_bits << dst_shift) & (dst_mask as u8));
+        // Hardening: bits past the end of `dst` are dropped (they were an out-of-bounds panic); callers check bounds.
+        if let Some(byte) = dst.get_mut(dst_index / 8) {
+            *byte = (*byte & !(dst_mask as u8)) | ((src_bits << dst_shift) & (dst_mask as u8));
+        }
 
         if dst_shift > 0 && length > (8 - dst_shift) {
             dst_mask >>= 8;
-            dst[dst_index / 8 + 1] &= !(dst_mask as u8);
-            dst[dst_index / 8 + 1] |= (src_bits >> (8 - dst_shift)) & (dst_mask as u8);
+            if let Some(byte) = dst.get_mut(dst_index / 8 + 1) {
+                *byte &= !(dst_mask as u8);
+                *byte |= (src_bits >> (8 - dst_shift)) & (dst_mask as u8);
+            }
         }
 
         if length < 8 {
@@ -479,11 +529,19 @@ pub(crate) fn copy_bits(
     }
 }
 
+/// Hardening: a buffer field of `length` bits at bit `offset` must lie inside a buffer of `bytes` bytes.
+fn check_field(bytes: usize, offset: usize, length: usize) -> Result<(), AmlError> {
+    match offset.checked_add(length) {
+        Some(end) if end <= bytes.saturating_mul(8) => Ok(()),
+        _ => Err(AmlError::IndexOutOfBounds),
+    }
+}
+
 #[inline]
 pub(crate) fn align_down(value: usize, align: usize) -> usize {
-    assert!(align == 0 || align.is_power_of_two());
-
-    if align == 0 {
+    // Hardening: was an `assert!`; the callers pass access widths (8 to 64 bits), and a width that is not a power of two
+    // is treated as no alignment.
+    if align == 0 || !align.is_power_of_two() {
         value
     } else {
         /*
