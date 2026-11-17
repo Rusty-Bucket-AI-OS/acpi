@@ -301,6 +301,22 @@ where
         Ok(())
     }
 
+    /// Loads a table again after its first load stopped part-way, typically on a name that another table, loaded
+    /// later, defines (`ObjectDoesNotExist` at load time). Firmware often splits its namespace over several SSDTs
+    /// that refer to each other, and the order they come in does not always match those references; loading every
+    /// table once, then loading the ones that stopped again, completes them, as ACPICA's two passes do.
+    ///
+    /// During this pass every object the table creates that already exists is **kept as it is** (with whatever
+    /// value it holds now), not replaced, and an existing alias is not a collision, so what the first pass made is
+    /// not reset; the table goes on past the point where it stopped. Code at the table's top level runs again, as it
+    /// would if the table were loaded once in the right order. Call it once all the other tables are loaded.
+    pub fn load_table_again(&self, stream: &[u8]) -> Result<(), AmlError> {
+        self.namespace.lock().set_keep_existing(true);
+        let result = self.load_table(stream);
+        self.namespace.lock().set_keep_existing(false);
+        result
+    }
+
     /// Evaluate an object at the given path in the namespace. If the object is a method, this
     /// invokes the method with the given set of arguments.
     pub fn evaluate(&self, path: AmlName, args: Vec<WrappedObject>) -> Result<WrappedObject, AmlError> {

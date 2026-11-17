@@ -31,6 +31,9 @@ pub struct Namespace {
     // Hardening: objects and levels, against `max_objects`.
     object_count: usize,
     max_objects: usize,
+    /// While a table that stopped part-way is loaded again ([`super::Interpreter::load_table_again`]): an object that
+    /// already exists is kept as it is, not replaced, and an alias that already exists is not a collision.
+    keep_existing: bool,
 }
 
 impl Namespace {
@@ -40,6 +43,7 @@ impl Namespace {
             root: NamespaceLevel::new(NamespaceLevelKind::Scope),
             object_count: 0,
             max_objects: usize::MAX,
+            keep_existing: false,
         };
 
         // Hardening: these were `.unwrap()`s on constant names (they cannot fail; they no longer can panic either).
@@ -147,6 +151,11 @@ impl Namespace {
         self.max_objects = max_objects;
     }
 
+    /// Whether objects that already exist are kept, not replaced (see [`super::Interpreter::load_table_again`]).
+    pub(crate) fn set_keep_existing(&mut self, keep: bool) {
+        self.keep_existing = keep;
+    }
+
     /// Hardening: one more object or level, if the limit allows.
     fn count_new(&mut self) -> Result<(), AmlError> {
         if self.object_count >= self.max_objects {
@@ -229,9 +238,14 @@ impl Namespace {
         let path = Self::checked(path)?;
 
         let at_limit = self.object_count >= self.max_objects;
+        let keep_existing = self.keep_existing;
         let (level, last_seg) = self.get_level_for_path_mut(&path)?;
         if at_limit && !level.values.contains_key(&last_seg) {
             return Err(AmlError::LimitExceeded(super::Limit::NamespaceObjects));
+        }
+        if keep_existing && level.values.contains_key(&last_seg) {
+            // A second pass over a table: what the first pass made stays, with whatever it holds now.
+            return Ok(());
         }
         match level.values.insert(last_seg, (ObjectFlags::new(false), object)) {
             None => {
@@ -253,9 +267,13 @@ impl Namespace {
         let path = Self::checked(path)?;
         self.count_new()?;
 
+        let keep_existing = self.keep_existing;
         let (level, last_seg) = self.get_level_for_path_mut(&path)?;
         if level.values.contains_key(&last_seg) {
             self.object_count -= 1;
+            if keep_existing {
+                return Ok(());
+            }
             return Err(AmlError::NameCollision(path));
         }
         level.values.insert(last_seg, (ObjectFlags::new(true), object));
